@@ -1,0 +1,17 @@
+build/
+*.o
+*.so
+*.a
+*.log
+*.pid
+bin/
+obj/
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.db
+*.exe
+*.dll
+__pycache__/
