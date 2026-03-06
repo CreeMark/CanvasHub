@@ -16,7 +16,7 @@
 
 #define MAX_EVENTS 64
 #define PORT 8080
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
 
 typedef struct {
     int fd;
@@ -85,19 +85,72 @@ static client_state_t* get_client(int fd) {
 
 // Helper to send WebSocket Frame
 static void send_ws_frame(int fd, const char *payload) {
-    if (!payload) return;
+    if (!payload || fd <= 0) return;
     size_t len = strlen(payload);
-    size_t frame_len = len + 10; // Header max
-    char *frame = malloc(frame_len);
-    if (!frame) return;
     
-     if (ws_build_frame(payload, len, frame, &frame_len) == 0) {
-        ssize_t sent = send(fd, frame, frame_len, MSG_NOSIGNAL);
-        if (sent != (ssize_t)frame_len) {
-            g_print("Warning: Incomplete frame sent: %zd/%zu bytes\n", sent, frame_len);
-        }
+    g_print("DEBUG: Preparing to send WS frame: payload_len=%zu\n", len);
+    
+    // 动态分配足够大的帧缓冲区
+    size_t max_frame_len = len + 14; // 最大头部14字节
+    char *frame = malloc(max_frame_len);
+    if (!frame) {
+        g_print("ERROR: Failed to allocate frame buffer (%zu bytes)\n", max_frame_len);
+        return;
+    }
+    
+    // 构建帧
+    size_t header_len = 2;
+    frame[0] = 0x81; // FIN, Text frame
+    
+    if (len < 126) {
+        frame[1] = len;
+    } else if (len < 65536) {
+        frame[1] = 126;
+        frame[2] = (len >> 8) & 0xFF;
+        frame[3] = len & 0xFF;
+        header_len = 4;
     } else {
-        g_print("Error:创建WebSocket帧失败\n");
+        frame[1] = 127;
+        // 64位长度
+        uint64_t len64 = len;
+        for (int i = 0; i < 8; i++) {
+            frame[2 + i] = (len64 >> (56 - i * 8)) & 0xFF;
+        }
+        header_len = 10;
+    }
+    
+    // 复制数据
+    memcpy(frame + header_len, payload, len);
+    size_t total_len = header_len + len;
+    
+    g_print("DEBUG: Sending WS frame: total_len=%zu, header_len=%zu, payload_len=%zu\n", 
+           total_len, header_len, len);
+    
+    // 分段发送大帧
+    ssize_t total_sent = 0;
+    int attempt = 0;
+    while (total_sent < (ssize_t)total_len && attempt < 10) {
+        attempt++;
+        
+        ssize_t sent = send(fd, frame + total_sent, total_len - total_sent, MSG_NOSIGNAL);
+        
+        if (sent <= 0) {
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                usleep(1000); // 等待1ms再试
+                continue;
+            }
+            g_print("ERROR: Failed to send WS frame: %s\n", strerror(errno));
+            break;
+        }
+        total_sent += sent;
+        
+        g_print("DEBUG: Sent %zd/%zu bytes of frame\n", total_sent, total_len);
+    }
+    
+    if (total_sent != (ssize_t)total_len) {
+        g_print("WARNING: Incomplete frame sent: %zd/%zu bytes\n", total_sent, total_len);
+    } else {
+        g_print("INFO: Sent WS frame: %zu bytes (payload: %zu)\n", total_len, len);
     }
 
     free(frame);
@@ -261,16 +314,47 @@ static void handle_message(client_state_t *client, char *msg, size_t len) {
             }
         }
     } else if (strcmp(type->valuestring, "save_canvas") == 0) {
-        if (client->room_id == 0) return;
-        cJSON *data = cJSON_GetObjectItem(root, "data");
-        if (data && cJSON_IsString(data)) {
-            if (db_save_project_data(client->room_id, data->valuestring) == 0) {
-                send_json_response(client->fd, "save_canvas_resp", "ok", "Canvas saved");
-            } else {
-                send_json_response(client->fd, "save_canvas_resp", "error", "Save failed");
-            }
+         if (client->room_id == 0) {
+        g_print("ERROR: Cannot save, client not in any room.\n");
+        return;
+    }
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (data && cJSON_IsString(data)) {
+        size_t data_len = strlen(data->valuestring);
+        g_print("INFO: Saving canvas for room %u, data length: %zu\n", 
+               client->room_id, data_len);
+        
+        // 验证是否为有效JSON
+        cJSON *test_json = cJSON_Parse(data->valuestring);
+        if (!test_json) {
+            g_print("ERROR: Canvas data is not valid JSON.\n");
+            send_json_response(client->fd, "save_canvas_resp", "error", "Invalid JSON data");
+            return;
         }
-    } else if (strcmp(type->valuestring, "draw") == 0 || 
+        cJSON_Delete(test_json);
+        
+        // 保存到数据库
+        g_print("INFO: Calling db_save_project_data for room %u\n", client->room_id);
+        int result = db_save_project_data(client->room_id, data->valuestring);
+        
+        if (result == 0) {
+            g_print("INFO: Canvas saved successfully for room %u\n", client->room_id);
+            send_json_response(client->fd, "save_canvas_resp", "ok", "Canvas saved");
+            
+            // 验证保存是否成功
+            char *saved_data = db_get_project_data(client->room_id);
+            if (saved_data) {
+                g_print("INFO: Verified save - retrieved data length: %zu\n", strlen(saved_data));
+                free(saved_data);
+            }
+        } else {
+            g_print("ERROR: Failed to save canvas for room %u. Database error.\n", client->room_id);
+            send_json_response(client->fd, "save_canvas_resp", "error", "Database save failed");
+        }
+    } else {
+        g_print("ERROR: Save canvas request missing or invalid 'data' field.\n");
+        send_json_response(client->fd, "save_canvas_resp", "error", "Missing or invalid data");
+    }} else if (strcmp(type->valuestring, "draw") == 0 || 
                strcmp(type->valuestring, "chat") == 0 ||
                strcmp(type->valuestring, "undo") == 0 ||
                strcmp(type->valuestring, "redo") == 0 ||
@@ -417,19 +501,24 @@ int main(void) {
                          int payload_len = buf[1] & 0x7F;
                          
                          if (payload_len == 126) {
-                             if (client->buf_len < 4) break;
-                             payload_start = 4;
-                             payload_len = (buf[2] << 8) | buf[3];
-                         } else if (payload_len == 127) {
-                             // Too big for now
-                             break;
-                         }
-                         
-                         int mask_len = (buf[1] & 0x80) ? 4 : 0;
-                         if (client->buf_len < payload_start + mask_len + payload_len) {
-                             // Wait for more data
-                             break;
-                         }
+    if (client->buf_len < 4) break;
+    payload_start = 4;
+    payload_len = (buf[2] << 8) | buf[3];
+} else if (payload_len == 127) {
+    if (client->buf_len < 10) break;
+    payload_start = 10;
+    // 64位长度
+    payload_len = 0;
+    for (int i = 2; i < 10; i++) {
+        payload_len = (payload_len << 8) | buf[i];
+    }
+}
+
+int mask_len = (buf[1] & 0x80) ? 4 : 0;
+if (client->buf_len < payload_start + mask_len + payload_len) {
+    // Wait for more data
+    break;
+}
                          
                          // We have a full frame
                          if (mask_len > 0) {

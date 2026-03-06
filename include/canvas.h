@@ -51,6 +51,12 @@ int canvas_draw(canvas_t *canvas, const draw_cmd_t *cmd);
 // 清空画布
 void canvas_clear(canvas_t *canvas);
 
+// 获取当前历史记录中的命令数量
+int canvas_get_command_count(void);  
+
+// 检查是否有历史记录
+int canvas_has_history(void);        
+
 #ifdef __cplusplus
 }
 #endif

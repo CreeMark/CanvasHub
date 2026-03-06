@@ -9,6 +9,7 @@
 #include "protocol.h"
 #include "network.h"
 
+
 // External declarations for Undo/Redo
 const draw_cmd_t *undo_redo_undo(void);
 const draw_cmd_t *undo_redo_redo(void);
@@ -312,20 +313,63 @@ static void on_load_local_clicked(GtkToolButton *btn, gpointer user_data) {
 static void on_save_clicked(GtkToolButton *btn, gpointer user_data) {
     (void)btn;
     AppWidgets *app = (AppWidgets *)user_data;
-    if (app->client) {
-        char *data = undo_redo_serialize();
-        if (data) {
-            cJSON *root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "type", "save_canvas");
-            cJSON_AddStringToObject(root, "data", data);
-            char *json = cJSON_PrintUnformatted(root);
-            net_client_send(app->client, json, strlen(json));
-            free(json);
-            cJSON_Delete(root);
-            g_print("Saving canvas, data length: %zu\n", strlen(data));
-            free(data);
-        }
+    
+    if (!app->client) {
+        g_print("ERROR: No client connection\n");
+        return;
     }
+    
+    g_print("INFO: Starting canvas save operation...\n");
+    
+    char *data = undo_redo_serialize();
+    if (!data) {
+        g_print("ERROR: undo_redo_serialize returned NULL\n");
+        return;
+    }
+    
+    g_print("INFO: Canvas data size: %zu bytes\n", strlen(data));
+    
+    // 检查数据是否有效
+    if (strlen(data) == 0 || strcmp(data, "[]") == 0) {
+        g_print("WARNING: No canvas data to save\n");
+        free(data);
+        return;
+    }
+    
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        g_print("ERROR: Failed to create JSON root\n");
+        free(data);
+        return;
+    }
+    
+    cJSON_AddStringToObject(root, "type", "save_canvas");
+    cJSON_AddStringToObject(root, "data", data);
+    
+    char *json = cJSON_PrintUnformatted(root);
+    if (!json) {
+        g_print("ERROR: Failed to print JSON\n");
+        cJSON_Delete(root);
+        free(data);
+        return;
+    }
+    
+    g_print("INFO: Total JSON size: %zu bytes\n", strlen(json));
+    
+    // 发送保存请求
+    int sent = net_client_send(app->client, json, strlen(json));
+    if (sent > 0) {
+        g_print("INFO: Save request sent successfully (%d bytes)\n", sent);
+    } else {
+        g_print("ERROR: Failed to send save request\n");
+    }
+    
+    // 清理资源
+    free(json);
+    cJSON_Delete(root);
+    free(data);
+    
+    g_print("INFO: Save request completed\n");
 }
 
 static void on_tool_clicked(GtkToolButton *btn, gpointer user_data) {
@@ -507,11 +551,6 @@ static gboolean configure_event_cb(GtkWidget *widget, GdkEventConfigure *event, 
     cairo_set_source_rgb(cr, 1, 1, 1);
     cairo_paint(cr);
     
-    // Copy old surface if exists, or repaint from history
-    // Since we have full history, it's better to repaint from history to handle resizing properly (vectors)
-    // But if history is large, it might be slow. 
-    // For now, let's just repaint from history which is the "correct" way for a vector drawing app.
-    
     cairo_destroy(cr);
     
     if (old_surface) cairo_surface_destroy(old_surface);
@@ -562,14 +601,38 @@ static void repaint_cmd_cb(const draw_cmd_t *cmd, void *user_data) {
     cairo_destroy(cr);
 }
 
+// 延迟重绘函数
+static gboolean delayed_repaint(gpointer user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    
+    if (app->surface) {
+        g_print("INFO: Delayed repaint, surface is now ready\n");
+        repaint_all(app);
+    } else {
+        g_print("WARNING: Surface still not ready after delay\n");
+    }
+    
+    return FALSE; // 只执行一次
+}
+
+// 确保repaint_all函数在surface未初始化时能正常工作
 static void repaint_all(AppWidgets *app) {
-    if (!app->surface) return;
+    if (!app->surface) {
+        g_print("WARNING: Cannot repaint, surface is NULL\n");
+        return;
+    }
+    
     cairo_t *cr = cairo_create(app->surface);
     cairo_set_source_rgb(cr, 1, 1, 1);
     cairo_paint(cr);
     cairo_destroy(cr);
+    
     undo_redo_iterate(repaint_cmd_cb, app);
     gtk_widget_queue_draw(app->drawing_area);
+    
+    // 使用正确的函数获取命令数量
+    int count = canvas_get_command_count();
+    g_print("INFO: Canvas repainted with %d commands\n", count);
 }
 
 // --- Message Handler ---
@@ -586,10 +649,6 @@ static gboolean update_ui_idle(gpointer user_data) {
         gtk_widget_queue_draw(app->window);
     } else if (app->phase == APP_PHASE_LOGIN) {
         // Handle login UI updates if needed
-        // For example, if we got a login error, we might want to show a dialog or update a label
-        // But for now, direct GTK calls in on_net_message seem to work for labels,
-        // unless they are from a different thread.
-        // GLib main loop callbacks run in the main thread, so it should be fine.
     }
     return FALSE; // Remove source
 }
@@ -598,9 +657,10 @@ static void on_net_message(const char *msg, size_t len, void *user_data) {
     (void)len;
     AppWidgets *app = (AppWidgets *)user_data;
     
-     g_print("RX: %.*s\n", (int)len, msg);  // 使用长度限制打印
+    g_print("RX: %.*s\n", (int)len, msg);
+    g_print("DEBUG: on_net_message: phase=%d, app=%p\n", app->phase, (void*)app);
 
-     if (!msg || len == 0) {
+    if (!msg || len == 0) {
         g_print("Warning: 空消息被接收\n");
         return;
     }
@@ -674,39 +734,51 @@ static void on_net_message(const char *msg, size_t len, void *user_data) {
             on_refresh_rooms_clicked(NULL, app); // Refresh list
         } else if (strcmp(type->valuestring, "join_room_resp") == 0) {
             cJSON *status = cJSON_GetObjectItem(root, "status");
+            g_print("DEBUG: join_room_resp received, phase before=%d\n", app->phase);
             if (status && strcmp(status->valuestring, "ok") == 0) {
+                // 在切换界面和加载任何数据前，清空本地绘制历史
+                undo_redo_init(50);
+                g_print("DEBUG: join_room_resp OK, phase before set=%d\n", app->phase);
                 app->phase = APP_PHASE_CANVAS;
+                g_print("DEBUG: join_room_resp OK, phase set to CANVAS (%d)\n", app->phase);
                 g_idle_add(update_ui_idle, app);
+
+                // 设置一个标志，表示正在等待画布数据
+                g_print("INFO: Waiting for canvas data...\n");
             }
         }
-    } else if (app->phase == APP_PHASE_CANVAS) {
-        // Draw, Chat, Undo, Redo, Clear
-        draw_msg_t draw_msg;
-        if (protocol_deserialize_draw(msg, &draw_msg) == 0) {
-            cairo_t *cr = cairo_create(app->surface);
-            if (draw_msg.tool_type == TOOL_ERASER) cairo_set_source_rgb(cr, 1, 1, 1);
-            else cairo_set_source_rgb(cr, ((draw_msg.color >> 16) & 0xFF)/255.0, ((draw_msg.color >> 8) & 0xFF)/255.0, (draw_msg.color & 0xFF)/255.0);
-            cairo_set_line_width(cr, draw_msg.width);
-            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-            if (draw_msg.point_count > 1 && draw_msg.points) {
-                cairo_move_to(cr, draw_msg.points[0].x, draw_msg.points[0].y);
-                for (size_t i = 1; i < draw_msg.point_count; i++) cairo_line_to(cr, draw_msg.points[i].x, draw_msg.points[i].y);
-                cairo_stroke(cr);
+    }
+    // 处理 CANVAS 阶段的消息（独立于 LOGIN 和 LOBBY 分支）
+    if (app->phase == APP_PHASE_CANVAS) {
+        g_print("DEBUG: APP_PHASE_CANVAS branch, type=%s\n", type->valuestring);
+        if (strcmp(type->valuestring, "draw") == 0) {
+            draw_msg_t draw_msg;
+            if (protocol_deserialize_draw(msg, &draw_msg) == 0) {
+                cairo_t *cr = cairo_create(app->surface);
+                if (draw_msg.tool_type == TOOL_ERASER) cairo_set_source_rgb(cr, 1, 1, 1);
+                else cairo_set_source_rgb(cr, ((draw_msg.color >> 16) & 0xFF)/255.0, ((draw_msg.color >> 8) & 0xFF)/255.0, (draw_msg.color & 0xFF)/255.0);
+                cairo_set_line_width(cr, draw_msg.width);
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+                if (draw_msg.point_count > 1 && draw_msg.points) {
+                    cairo_move_to(cr, draw_msg.points[0].x, draw_msg.points[0].y);
+                    for (size_t i = 1; i < draw_msg.point_count; i++) cairo_line_to(cr, draw_msg.points[i].x, draw_msg.points[i].y);
+                    cairo_stroke(cr);
+                }
+                cairo_destroy(cr);
+                gtk_widget_queue_draw(app->drawing_area);
+                
+                draw_cmd_t cmd;
+                cmd.tool = (tool_type_t)draw_msg.tool_type;
+                cmd.color = draw_msg.color;
+                cmd.line_width = draw_msg.width;
+                cmd.point_count = draw_msg.point_count;
+                cmd.points = (point_t *)draw_msg.points; 
+                cmd.layer_id = 0;
+                undo_redo_push(&cmd);
+                protocol_free_draw_msg(&draw_msg);
             }
-            cairo_destroy(cr);
-            gtk_widget_queue_draw(app->drawing_area);
-            
-            draw_cmd_t cmd;
-            cmd.tool = (tool_type_t)draw_msg.tool_type;
-            cmd.color = draw_msg.color;
-            cmd.line_width = draw_msg.width;
-            cmd.point_count = draw_msg.point_count;
-            cmd.points = (point_t *)draw_msg.points; 
-            cmd.layer_id = 0;
-            undo_redo_push(&cmd);
-            protocol_free_draw_msg(&draw_msg);
-        } else {
+        } else if (strcmp(type->valuestring, "chat") == 0) {
             chat_msg_t chat_msg;
             if (protocol_deserialize_chat(msg, &chat_msg) == 0) {
                 if (strcmp(chat_msg.sender, app->username) != 0) {
@@ -716,32 +788,74 @@ static void on_net_message(const char *msg, size_t len, void *user_data) {
                     snprintf(display_msg, sizeof(display_msg), "%.32s: %.440s\n", chat_msg.sender, chat_msg.content);
                     gtk_text_buffer_insert(app->chat_buffer, &end, display_msg, -1);
                 }
-            } else if (strcmp(type->valuestring, "undo") == 0) {
-                const draw_cmd_t *cmd = undo_redo_undo();
-                if (cmd) repaint_all(app);
-            } else if (strcmp(type->valuestring, "redo") == 0) {
-                const draw_cmd_t *cmd = undo_redo_redo();
-                if (cmd) repaint_all(app);
-            } else if (strcmp(type->valuestring, "clear") == 0) {
-                if (app->surface) {
-                    cairo_t *cr = cairo_create(app->surface);
-                    cairo_set_source_rgb(cr, 1, 1, 1);
-                    cairo_paint(cr);
-                    cairo_destroy(cr);
-                    gtk_widget_queue_draw(app->drawing_area);
-                    undo_redo_init(50);
-                }
-            } else if (strcmp(type->valuestring, "load_canvas") == 0) {
-                cJSON *data = cJSON_GetObjectItem(root, "data");
-                if (data && cJSON_IsString(data)) {
+            }
+        } else if (strcmp(type->valuestring, "undo") == 0) {
+            const draw_cmd_t *cmd = undo_redo_undo();
+            if (cmd) repaint_all(app);
+        } else if (strcmp(type->valuestring, "redo") == 0) {
+            const draw_cmd_t *cmd = undo_redo_redo();
+            if (cmd) repaint_all(app);
+        } else if (strcmp(type->valuestring, "clear") == 0) {
+            if (app->surface) {
+                cairo_t *cr = cairo_create(app->surface);
+                cairo_set_source_rgb(cr, 1, 1, 1);
+                cairo_paint(cr);
+                cairo_destroy(cr);
+                gtk_widget_queue_draw(app->drawing_area);
+                undo_redo_init(50);
+            }
+        } else if (strcmp(type->valuestring, "load_canvas") == 0) {
+            g_print("DEBUG: load_canvas message received, phase=%d\n", app->phase);
+            cJSON *data = cJSON_GetObjectItem(root, "data");
+            g_print("DEBUG: data=%p, type=%d, is_string=%d\n", (void*)data, data ? data->type : -1, data ? cJSON_IsString(data) : -1);
+            if (data && cJSON_IsString(data)) {
+                size_t data_len = strlen(data->valuestring);
+                g_print("INFO: Received load_canvas, data length: %zu, first 50 chars: %.50s\n", data_len, data->valuestring);
+                
+                // 检查数据是否为空
+                if (data_len == 0 || strcmp(data->valuestring, "[]") == 0) {
+                    g_print("INFO: No canvas data to load\n");
+                    // 清空画布
                     if (app->surface) {
                         cairo_t *cr = cairo_create(app->surface);
                         cairo_set_source_rgb(cr, 1, 1, 1);
                         cairo_paint(cr);
                         cairo_destroy(cr);
                     }
+                    undo_redo_init(50);
+                    gtk_widget_queue_draw(app->drawing_area);
+                } else {
+                    // 反序列化数据
+                    g_print("INFO: Deserializing canvas data...\n");
                     undo_redo_deserialize(data->valuestring);
-                    repaint_all(app);
+                    int cmd_count = canvas_get_command_count();
+                    g_print("INFO: Canvas data deserialized, command count: %d\n", cmd_count);
+                    
+                    // 重绘画布
+                    if (app->surface) {
+                        g_print("INFO: Repainting canvas with %d commands\n", cmd_count);
+                        repaint_all(app);
+                    } else {
+                        g_print("WARNING: Surface not ready, scheduling delayed repaint\n");
+                        g_timeout_add(200, (GSourceFunc)delayed_repaint, app);
+                    }
+                }
+            } else {
+                g_print("ERROR: load_canvas data field is missing or not a string!\n");
+            }
+        } else if (strcmp(type->valuestring, "save_canvas_resp") == 0) {
+            cJSON *status = cJSON_GetObjectItem(root, "status");
+            cJSON *message = cJSON_GetObjectItem(root, "message");
+
+            if (status && message) {
+                g_print("INFO: Save response: status=%s, message=%s\n", 
+                       status->valuestring, message->valuestring);
+                
+                // 在界面上显示保存结果
+                if (strcmp(status->valuestring, "ok") == 0) {
+                    g_print("INFO: Canvas saved successfully!\n");
+                } else {
+                    g_print("ERROR: Canvas save failed: %s\n", message->valuestring);
                 }
             }
         }
@@ -769,7 +883,6 @@ static void clear_container(AppWidgets *app) {
     app->room_tree_view = NULL;
     app->room_list_store = NULL;
 }
-
 static void build_login_ui(AppWidgets *app) {
     app->phase = APP_PHASE_LOGIN;
     clear_container(app);
@@ -802,7 +915,6 @@ static void build_login_ui(AppWidgets *app) {
     gtk_box_pack_start(GTK_BOX(box), app->login_btn_box, FALSE, FALSE, 10);
 
     GtkWidget *login_btn = gtk_button_new_with_label("Login");
-    // CRITICAL: Ensure we use 'clicked' for button
     g_signal_connect(login_btn, "clicked", G_CALLBACK(on_login_clicked), app);
     gtk_container_add(GTK_CONTAINER(app->login_btn_box), login_btn);
 
@@ -823,16 +935,12 @@ static void build_login_ui(AppWidgets *app) {
     gtk_container_add(GTK_CONTAINER(app->register_container), back_login_btn);
     
     // Initial State: Login Mode
-    // CRITICAL: Ensure widgets are realized before hiding/showing if using show_all later
-    // But since we use show_all at the end, we need to hide AFTER show_all
-    
     app->login_status_label = gtk_label_new("");
     gtk_box_pack_start(GTK_BOX(box), app->login_status_label, FALSE, FALSE, 0);
 
     gtk_widget_show_all(app->window);
     
     // HIDE widgets that should be hidden initially
-    // We must do this AFTER show_all because show_all recursively shows everything
     gtk_widget_hide(app->login_entry_email);
     gtk_widget_hide(app->register_container);
     
@@ -900,7 +1008,7 @@ static void build_lobby_ui(AppWidgets *app) {
 static void build_canvas_ui(AppWidgets *app) {
     app->phase = APP_PHASE_CANVAS;
     clear_container(app);
-    undo_redo_init(50);
+    // undo_redo_init(50); // Removed to prevent wiping history loaded from network
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(app->main_container), vbox);
@@ -957,8 +1065,6 @@ static void build_canvas_ui(AppWidgets *app) {
     // Drawing Area
     app->drawing_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(app->drawing_area, 600, 400);
-    // Use gtk_box_pack_start instead of paned for simplicity if paned is causing issues,
-    // but paned should be fine if we set hexpand/vexpand
     gtk_widget_set_hexpand(app->drawing_area, TRUE);
     gtk_widget_set_vexpand(app->drawing_area, TRUE);
     gtk_paned_pack1(GTK_PANED(hpaned), app->drawing_area, TRUE, TRUE);
@@ -998,6 +1104,12 @@ static void build_canvas_ui(AppWidgets *app) {
     gtk_paned_set_position(GTK_PANED(hpaned), 600);
 
     gtk_widget_show_all(app->window);
+
+    if (canvas_has_history()) {
+        g_print("INFO: Canvas UI built, checking for existing history...\n");
+        // 延迟重绘
+        g_timeout_add(200, (GSourceFunc)delayed_repaint, app);
+    }
 }
 
 static void activate(GtkApplication *app, gpointer user_data) {

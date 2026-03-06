@@ -245,10 +245,6 @@ int ws_parse_frame(const char *in_frame, size_t in_len, char **out_payload, size
     (void)b0; // Unused for now
     unsigned char b1 = in_frame[1];
     
-    // Check FIN and Opcode (assume text)
-    // if ((b0 & 0x80) == 0) ... // Fragmented
-    // if ((b0 & 0x0F) != 1) ... // Not text
-    
     int masked = (b1 & 0x80) != 0;
     uint64_t payload_len = b1 & 0x7F;
     
@@ -259,40 +255,51 @@ int ws_parse_frame(const char *in_frame, size_t in_len, char **out_payload, size
         header_len = 4;
     } else if (payload_len == 127) {
         // 64-bit length
+        if (in_len < 10) return -2; // Incomplete
         header_len = 10;
-        return -1; // Unsupported
+        // 64位长度
+        payload_len = 0;
+        for (int i = 2; i < 10; i++) {
+            payload_len = (payload_len << 8) | (uint8_t)in_frame[i];
+        }
     }
     
-    // Server to client frames are usually NOT masked.
-    // If masked bit is set, we need to handle it, but header_len increases.
-    // However, if we wrongly assume it's masked or unmasked, we mess up payload pointer.
-    
-    unsigned char mask[4] = {0};
+    // 添加掩码长度
     if (masked) {
         if (in_len < header_len + 4) return -2; // Incomplete
-        memcpy(mask, in_frame + header_len, 4);
         header_len += 4;
     }
     
-    if (in_len < header_len + payload_len) return -2; // Incomplete
-
-    //Bug001 fix: 分配新内存存储解掩码后的数据
+    // 检查是否有足够的完整数据
+    uint64_t total_len_needed = header_len + payload_len;
+    if (in_len < total_len_needed) {
+        g_print("DEBUG: Incomplete frame: in_len=%zu, need=%lu, payload_len=%lu\n", 
+               in_len, (unsigned long)total_len_needed, (unsigned long)payload_len);
+        return -2; // Incomplete
+    }
+    
+    // 分配内存
     char *payload = malloc(payload_len + 1);
     if (!payload) return -1;
     
+    // 复制数据
     memcpy(payload, in_frame + header_len, payload_len);
     
     // 解掩码
     if (masked) {
+        unsigned char mask[4];
+        memcpy(mask, in_frame + header_len - 4, 4);
         for (size_t i = 0; i < payload_len; i++) {
             payload[i] ^= mask[i % 4];
         }
     }
     
-    payload[payload_len] = '\0'; // 添加终止符
-
+    payload[payload_len] = '\0';
     *out_payload = payload;
     *out_payload_len = payload_len;
-    g_print("Parsing frame: in_len=%zu, masked=%d, payload_len=%lu\n", in_len, masked, (unsigned long)payload_len);
+    
+    g_print("Parsing frame: in_len=%zu, masked=%d, payload_len=%lu, consumed=%zu\n", 
+           in_len, masked, (unsigned long)payload_len, header_len + payload_len);
+    
     return header_len + payload_len;
 }

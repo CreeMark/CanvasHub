@@ -127,63 +127,153 @@ const draw_cmd_t *undo_redo_redo(void) {
 }
 
 void undo_redo_iterate(void (*cb)(const draw_cmd_t *, void *), void *user_data) {
-    if (!g_history.head) return;
+    g_print("DEBUG: undo_redo_iterate - head=%p, current=%p, tail=%p\n",
+           (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail);
+    if (!g_history.head) {
+        g_print("WARNING: undo_redo_iterate - head is NULL\n");
+        return;
+    }
     
     // If current is NULL, it means we are at the state BEFORE the first action.
     // So we should not iterate anything (empty canvas).
-    if (!g_history.current) return;
+    if (!g_history.current) {
+        g_print("WARNING: undo_redo_iterate - current is NULL\n");
+        return;
+    }
 
     action_node_t *node = g_history.head;
+    int count = 0;
     while (node) {
+        count++;
         cb(&node->cmd, user_data);
         if (node == g_history.current) break; // 只遍历到当前状态
         node = node->next;
     }
+    g_print("DEBUG: undo_redo_iterate - iterated %d commands\n", count);
 }
 
 char *undo_redo_serialize(void) {
-    if (!g_history.head || !g_history.current) return strdup("[]");
+    // 1. 增强的空历史检查
+    if (!g_history.head) {
+        // 历史为空，返回空数组
+        return strdup("[]");
+    }
     
+    // 2. 如果current为NULL，表示在第一个操作之前的状态
+    // 也应该返回空数组
+    if (!g_history.current) {
+        return strdup("[]");
+    }
+    
+    // 3. 创建JSON数组
     cJSON *root = cJSON_CreateArray();
+    if (!root) {
+        g_print("ERROR: Failed to create JSON array\n");
+        return strdup("[]");
+    }
+    
+    // 4. 遍历历史节点
     action_node_t *node = g_history.head;
+    int command_count = 0;
     
     while (node) {
+        // 安全检查每个命令
+        if (node->cmd.point_count > 0 && !node->cmd.points) {
+            g_print("WARNING: Command has point_count=%zu but points is NULL\n", 
+                   node->cmd.point_count);
+            // 跳过这个无效命令
+            node = node->next;
+            continue;
+        }
+        
+        // 创建命令对象
         cJSON *item = cJSON_CreateObject();
+        if (!item) {
+            g_print("ERROR: Failed to create command object\n");
+            break;
+        }
+        
+        // 添加基本属性
         cJSON_AddNumberToObject(item, "tool", node->cmd.tool);
         cJSON_AddNumberToObject(item, "color", node->cmd.color);
         cJSON_AddNumberToObject(item, "width", node->cmd.line_width);
-        cJSON_AddNumberToObject(item, "count", node->cmd.point_count);
+        cJSON_AddNumberToObject(item, "count", (double)node->cmd.point_count);
         
+        // 创建点数组
         cJSON *points = cJSON_CreateArray();
+        if (!points) {
+            g_print("ERROR: Failed to create points array\n");
+            cJSON_Delete(item);
+            break;
+        }
+        
+        // 安全添加点坐标
         if (node->cmd.point_count > 0 && node->cmd.points) {
             for (size_t i = 0; i < node->cmd.point_count; i++) {
                 cJSON *p = cJSON_CreateObject();
+                if (!p) {
+                    g_print("ERROR: Failed to create point object\n");
+                    break;
+                }
                 cJSON_AddNumberToObject(p, "x", node->cmd.points[i].x);
                 cJSON_AddNumberToObject(p, "y", node->cmd.points[i].y);
                 cJSON_AddItemToArray(points, p);
             }
         }
+        
         cJSON_AddItemToObject(item, "points", points);
         cJSON_AddItemToArray(root, item);
         
-        if (node == g_history.current) break;
+        command_count++;
+        
+        // 如果到达当前指针，停止遍历
+        if (node == g_history.current) {
+            break;
+        }
+        
+        // 移动到下一个节点
         node = node->next;
     }
     
+    // 5. 生成JSON字符串
     char *out = cJSON_PrintUnformatted(root);
+    if (!out) {
+        g_print("ERROR: Failed to print JSON (cJSON_PrintUnformatted returned NULL)\n");
+        cJSON_Delete(root);
+        return strdup("[]");
+    }
+    
+    g_print("INFO: Serialized %d commands, JSON length: %zu\n", 
+           command_count, strlen(out));
+    
     cJSON_Delete(root);
     return out;
 }
 
 void undo_redo_deserialize(const char *json) {
-    undo_redo_init(g_history.max_steps); // Clear existing
+    g_print("DEBUG: undo_redo_deserialize called with JSON length: %zu\n", strlen(json));
+    
+    // FIX: Ensure max_steps is at least 50 to prevent immediate deletion of pushed commands
+    int steps = g_history.max_steps > 0 ? g_history.max_steps : 50;
+    undo_redo_init(steps); 
     
     cJSON *root = cJSON_Parse(json);
-    if (!root) return;
+    if (!root) {
+        g_print("ERROR: undo_redo_deserialize failed to parse JSON: %s\n", cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "unknown error");
+        g_print("DEBUG: JSON content (first 100 chars): %.100s\n", json);
+        return;
+    }
     
+    if (!cJSON_IsArray(root)) {
+        g_print("ERROR: undo_redo_deserialize JSON root is not an array\n");
+        cJSON_Delete(root);
+        return;
+    }
+
+    int loaded_count = 0;
     cJSON *item = NULL;
     cJSON_ArrayForEach(item, root) {
-        draw_cmd_t cmd;
+        draw_cmd_t cmd = {0}; // Initialize to zero
         cJSON *tool = cJSON_GetObjectItem(item, "tool");
         cJSON *color = cJSON_GetObjectItem(item, "color");
         cJSON *width = cJSON_GetObjectItem(item, "width");
@@ -193,24 +283,109 @@ void undo_redo_deserialize(const char *json) {
         if (tool) cmd.tool = (tool_type_t)tool->valueint;
         if (color) cmd.color = (uint32_t)color->valuedouble;
         if (width) cmd.line_width = width->valuedouble;
-        if (count) cmd.point_count = (size_t)count->valueint;
+        if (count && cJSON_IsNumber(count)) {
+            cmd.point_count = (size_t)count->valuedouble;
+        } else {
+            g_print("WARNING: count field missing or not a number\n");
+            cmd.point_count = 0;
+        }
+        
+        g_print("DEBUG: Parsing command: tool=%d, color=%u, width=%.1f, count=%zu, points=%p\n", 
+               cmd.tool, cmd.color, cmd.line_width, cmd.point_count, (void*)points);
         
         if (points && cJSON_IsArray(points)) {
             cmd.points = malloc(sizeof(point_t) * cmd.point_count);
-            int i = 0;
-            cJSON *p = NULL;
-            cJSON_ArrayForEach(p, points) {
-                if (i >= cmd.point_count) break;
-                cJSON *x = cJSON_GetObjectItem(p, "x");
-                cJSON *y = cJSON_GetObjectItem(p, "y");
-                if (x) cmd.points[i].x = x->valuedouble;
-                if (y) cmd.points[i].y = y->valuedouble;
-                i++;
+            if (cmd.points) {
+                int i = 0;
+                cJSON *p = NULL;
+                cJSON_ArrayForEach(p, points) {
+                    if (i >= cmd.point_count) break;
+                    cJSON *x = cJSON_GetObjectItem(p, "x");
+                    cJSON *y = cJSON_GetObjectItem(p, "y");
+                    if (x) cmd.points[i].x = x->valuedouble;
+                    if (y) cmd.points[i].y = y->valuedouble;
+                    i++;
+                }
+                cmd.layer_id = 0;
+                g_print("DEBUG: Before push - head=%p, current=%p, tail=%p\n", 
+                       (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail);
+                undo_redo_push(&cmd);
+                g_print("DEBUG: After push - head=%p, current=%p, tail=%p, count=%d\n", 
+                       (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail, g_history.count);
+                free(cmd.points);
+                loaded_count++;
+            } else {
+                g_print("ERROR: Failed to allocate memory for points in deserialize\n");
             }
-            cmd.layer_id = 0;
-            undo_redo_push(&cmd);
-            free(cmd.points);
+        } else {
+            // Attempt to handle legacy flat format (single point per command)
+            cJSON *x = cJSON_GetObjectItem(item, "x");
+            cJSON *y = cJSON_GetObjectItem(item, "y");
+            if (x && y) {
+                // Legacy format detected
+                if (!tool) {
+                     cJSON *type_legacy = cJSON_GetObjectItem(item, "type");
+                     if (type_legacy) cmd.tool = (tool_type_t)type_legacy->valueint;
+                }
+                if (!width) {
+                     cJSON *size_legacy = cJSON_GetObjectItem(item, "size");
+                     if (size_legacy) cmd.line_width = size_legacy->valuedouble;
+                }
+                
+                // If color was not found by "color" key (unlikely as it matches), we keep default 0
+                
+                cmd.point_count = 1;
+                cmd.points = malloc(sizeof(point_t));
+                if (cmd.points) {
+                    cmd.points[0].x = x->valuedouble;
+                    cmd.points[0].y = y->valuedouble;
+                    cmd.layer_id = 0;
+                    undo_redo_push(&cmd);
+                    free(cmd.points);
+                    loaded_count++;
+                }
+            } else {
+                g_print("WARNING: Skipping command without valid points array or legacy coordinates\n");
+            }
         }
     }
+    g_print("INFO: Successfully loaded %d commands from JSON\n", loaded_count);
+    g_print("DEBUG: Final state - head=%p, current=%p, tail=%p, count=%d\n", 
+           (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail, g_history.count);
+    // Set current to tail so canvas_get_command_count works correctly
+    g_history.current = g_history.tail;
+    g_print("DEBUG: After setting current - head=%p, current=%p, tail=%p\n", 
+           (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail);
+    
+    // Verify that history is correctly set up
+    if (loaded_count > 0 && (!g_history.head || !g_history.current)) {
+        g_print("ERROR: History is not correctly set up after deserialization!\n");
+    }
+    
     cJSON_Delete(root);
+}
+
+int canvas_get_command_count(void) {
+    g_print("DEBUG: canvas_get_command_count - head=%p, current=%p, tail=%p, count=%d\n",
+           (void*)g_history.head, (void*)g_history.current, (void*)g_history.tail, g_history.count);
+    if (!g_history.head || !g_history.current) {
+        g_print("WARNING: head or current is NULL\n");
+        return 0;
+    }
+    
+    int count = 0;
+    action_node_t *node = g_history.head;
+    while (node) {
+        count++;
+        if (node == g_history.current) {
+            break;
+        }
+        node = node->next;
+    }
+    g_print("DEBUG: canvas_get_command_count returning %d\n", count);
+    return count;
+}
+
+int canvas_has_history(void) {
+    return (g_history.head != NULL && g_history.current != NULL);
 }

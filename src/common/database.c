@@ -130,41 +130,73 @@ void db_free_project_list(project_t *projects) {
 }
 
 int db_save_project_data(uint32_t project_id, const char *data) {
-    if (!conn) return -1;
-    // Need to escape data string as it's JSON and might contain quotes
-    char *escaped = malloc(strlen(data) * 2 + 1);
-    mysql_real_escape_string(conn, escaped, data, strlen(data));
+    if (!conn) {
+        g_print("ERROR: No database connection\n");
+        return -1;
+    }
     
-    char *query = malloc(strlen(escaped) + 256);
-    sprintf(query, "UPDATE projects SET canvas_data='%s' WHERE id=%u", escaped, project_id);
+    // Calculate required buffer size
+    size_t data_len = strlen(data);
+    if (data_len == 0) {
+        // Handle empty canvas
+        char query[128];
+        snprintf(query, sizeof(query), "UPDATE projects SET canvas_data='[]' WHERE id=%u", project_id);
+        return mysql_query(conn, query) ? -1 : 0;
+    }
+    
+    // 转义数据
+    char *escaped = malloc(data_len * 2 + 1);
+    if (!escaped) {
+        g_print("ERROR: Out of memory for escaping\n");
+        return -1;
+    }
+    
+    unsigned long escaped_len = mysql_real_escape_string(conn, escaped, data, data_len);
+    if (escaped_len == (unsigned long)-1) {
+        g_print("ERROR: mysql_real_escape_string failed: %s\n", mysql_error(conn));
+        free(escaped);
+        return -1;
+    }
+    
+    // 构建查询
+    char query[escaped_len + 256];
+    snprintf(query, escaped_len + 256, 
+             "UPDATE projects SET canvas_data='%s' WHERE id=%u", 
+             escaped, project_id);
+    
+    g_print("INFO: Executing SQL: UPDATE projects SET canvas_data='[%zu chars]' WHERE id=%u\n", 
+           escaped_len, project_id);
     
     int ret = 0;
     if (mysql_query(conn, query)) {
-        fprintf(stderr, "Save canvas failed: %s\n", mysql_error(conn));
+        g_print("ERROR: Save canvas failed: %s\n", mysql_error(conn));
         ret = -1;
+    } else {
+        g_print("INFO: Database update successful for project %u\n", project_id);
     }
     
     free(escaped);
-    free(query);
     return ret;
 }
 
 char *db_get_project_data(uint32_t project_id) {
-    if (!conn) return NULL;
+    if (!conn) return strdup("[]"); // 返回默认空数组
     char query[128];
     snprintf(query, sizeof(query), "SELECT canvas_data FROM projects WHERE id=%u", project_id);
     
     if (mysql_query(conn, query)) {
-        return NULL;
+        return strdup("[]");
     }
     
     MYSQL_RES *result = mysql_store_result(conn);
-    if (!result) return NULL;
+    if (!result) return strdup("[]");
     
     char *data = NULL;
     MYSQL_ROW row = mysql_fetch_row(result);
     if (row && row[0]) {
         data = strdup(row[0]);
+    } else {
+        data = strdup("[]"); // 数据库有记录但字段为空，也返回空数组
     }
     
     mysql_free_result(result);
