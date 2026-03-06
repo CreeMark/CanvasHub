@@ -1,59 +1,137 @@
-# Canvas Refactoring Project
+# Canvas - 多用户实时协作绘画应用
 
-## 项目章程 (Project Charter)
+一个基于 C 语言开发的支持多用户实时协作的绘画与聊天应用。
 
-### 1. 项目目标
-重构整个 Canvas 工程，实现一个支持多用户实时协作的绘画与聊天应用。
+## 功能特性
 
-### 2. 核心功能需求
-- **基础功能**: 文件保存/打开 (自定义格式/标准格式)。
-- **用户系统**: 注册、登录、权限管理。
-- **绘画功能**: 自由画笔、橡皮擦、撤销/重做、画布清理。
-- **协作功能**: 多用户实时同步绘画、实时聊天室。
-- **项目管理**: 简单的项目列表管理。
-- **数据存储**: 数据库设计 (用户信息、项目元数据)。
+- **用户系统**: 注册、登录认证
+- **绘画功能**: 自由画笔、橡皮擦、撤销/重做、画布清理
+- **协作功能**: 多用户实时同步绘画、实时聊天室
+- **项目管理**: 创建/加入房间、项目列表管理
+- **数据持久化**: MySQL 数据库存储用户信息和画布状态
+- **本地存储**: 支持画布数据本地保存/加载
 
-### 3. 技术栈
-- **语言**: C (C11/C17)
-- **GUI**: GTK 3 (C API)
-- **图形库**: Cairo
-- **网络**: libwebsockets (C)
-- **数据交互**: cJSON
-- **数据库**: MySQL 8.x C API
-- **构建系统**: CMake
-- **平台**: PC (Linux/Windows)
+## 技术栈
 
-### 4. 验收标准
-- 代码符合 **Linux Kernel Coding Style** 或 **MISRA-C 2012**。
-- 单元测试覆盖率 > 90% (使用 Unity/CMocka)。
-- 多用户绘画延迟 < 100ms。
-- 内存泄漏为 0 (Valgrind 检测)。
+| 组件 | 技术 |
+|------|------|
+| 语言 | C (C17) |
+| GUI | GTK 3 |
+| 图形库 | Cairo |
+| 网络 | WebSocket (自定义实现) |
+| 数据交互 | cJSON |
+| 数据库 | MySQL 8.x |
+| 构建系统 | Make |
 
-## 项目进度 (Gantt Chart)
+## 项目结构
 
-```mermaid
-gantt
-    title Canvas Refactoring Roadmap
-    dateFormat  YYYY-MM-DD
-    section Phase 1: Init & Design
-    项目初始化 & 需求分析       :done, task0, 2026-03-03, 1d
-    技术方案选型               :done, task1, after task0, 1d
-    模块拆分 & 接口定义         :done, task2, after task1, 1d
-    
-    section Phase 2: Core Dev
-    编码规范 & Repo配置         :active, task3, after task2, 1d
-    核心模块TDD (Protocol/DB)  :task4, after task3, 4d
-    GUI 框架搭建               :task5, after task4, 3d
-    
-    section Phase 3: Features
-    多用户网络同步              :task6, after task5, 5d
-    绘画工具实现                :task7, after task6, 4d
-    撤销/重做 & 聊天            :task8, after task7, 3d
-    
-    section Phase 4: Delivery
-    集成测试 & 优化             :task9, after task8, 3d
-    交付 & 复盘                 :task10, after task9, 2d
+```
+Canvas/
+├── deps/              # 第三方依赖
+│   └── cJSON/         # JSON 解析库
+├── include/           # 头文件
+├── src/
+│   ├── client/        # 客户端代码 (GUI + 网络客户端)
+│   ├── server/        # 服务端代码
+│   ├── common/        # 公共代码 (画布、数据库、撤销重做)
+│   └── protocol/      # 协议编解码
+├── tests/             # 单元测试
+├── Makefile           # 构建脚本
+└── schema.sql         # 数据库架构
 ```
 
-## 当前状态
-- **Task-1**: 需求澄清 & 技术方案选型
+## 快速开始
+
+### 环境要求
+
+- GCC (支持 C17)
+- GTK 3 开发库
+- MySQL 8.x 开发库
+- Make
+
+### Linux (Ubuntu) 安装依赖
+
+```bash
+sudo apt update
+sudo apt install libgtk-3-dev libmysqlclient-dev build-essential
+```
+
+### 编译
+
+```bash
+make clean && make
+```
+
+### 配置数据库
+
+```bash
+# 登录 MySQL
+mysql -u root -p
+
+# 执行数据库脚本
+source schema.sql
+```
+
+### 运行
+
+```bash
+# 启动服务端
+./build/bin/canvas_server
+
+# 启动客户端 (另一个终端)
+./build/bin/canvas_client
+```
+
+## 使用说明
+
+1. **注册/登录**: 首次使用需要注册账号，然后登录
+2. **选择房间**: 在大厅中选择或创建一个房间
+3. **绘画**: 使用工具栏选择画笔/橡皮擦，在画布上绘制
+4. **协作**: 其他用户加入同一房间后可实时看到绘画内容
+5. **保存**: 点击 Save 按钮将画布保存到服务器
+
+## 开发指南
+
+### 代码风格
+
+项目遵循 Linux Kernel Coding Style，使用 `.clang-format` 配置文件。
+
+### 运行测试
+
+```bash
+make test
+```
+
+### 调试模式
+
+编译时已包含 `-g` 标志，可使用 GDB 调试：
+
+```bash
+gdb ./build/bin/canvas_server
+gdb ./build/bin/canvas_client
+```
+
+## 协议说明
+
+客户端与服务端通过 WebSocket 通信，消息格式为 JSON：
+
+```json
+{
+  "type": "message_type",
+  "data": { ... }
+}
+```
+
+主要消息类型：
+- `login` / `login_resp`: 登录
+- `register` / `register_resp`: 注册
+- `list_rooms` / `room_list`: 房间列表
+- `join_room` / `join_room_resp`: 加入房间
+- `load_canvas`: 加载画布数据
+- `draw`: 绘画同步
+- `chat`: 聊天消息
+- `save_canvas` / `save_canvas_resp`: 保存画布
+
+## 许可证
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE) 文件。

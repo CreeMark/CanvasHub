@@ -16,3 +16,4 @@ obj/
 *.exe
 *.dll
 __pycache__/
+docs/
