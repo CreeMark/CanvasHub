@@ -28,6 +28,11 @@ int protocol_deserialize_auth(const char *json, auth_msg_t *out_msg) {
     if (u && u->valuestring) strncpy(out_msg->username, u->valuestring, sizeof(out_msg->username)-1);
     if (p && p->valuestring) strncpy(out_msg->password, p->valuestring, sizeof(out_msg->password)-1);
     if (e && e->valuestring) strncpy(out_msg->email, e->valuestring, sizeof(out_msg->email)-1);
+
+    out_msg->username[sizeof(out_msg->username)-1] = '\0';
+    out_msg->password[sizeof(out_msg->password)-1] = '\0';
+    out_msg->email[sizeof(out_msg->email)-1] = '\0';
+
     cJSON_Delete(root);
     return 0;
 }

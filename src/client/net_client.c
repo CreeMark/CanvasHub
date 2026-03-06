@@ -151,16 +151,14 @@ static gboolean socket_io_callback(GIOChannel *source, GIOCondition condition, g
                     
                     if (consumed > 0) {
                          if (client->on_message) {
-                             // Create null-terminated copy for safe processing
-                             char *safe_payload = malloc(payload_len + 1);
-                             if (safe_payload) {
-                                 memcpy(safe_payload, payload, payload_len);
-                                 safe_payload[payload_len] = '\0';
-                                 client->on_message(safe_payload, payload_len, client->user_data);
-                                 free(safe_payload);
-                             }
+                             // 不再需要创建副本，因为ws_parse_frame已经分配了内存
+                             // 但需要确保payload以null终止
+                            client->on_message(payload, payload_len, client->user_data);
                          }
-                         
+                          // 释放内存
+                        if (payload) {
+                                free(payload);
+                        }
                          // Move remaining
                          size_t remaining = client->buf_len - consumed;
                          if (remaining > 0) {

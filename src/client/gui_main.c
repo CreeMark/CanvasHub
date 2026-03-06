@@ -322,6 +322,7 @@ static void on_save_clicked(GtkToolButton *btn, gpointer user_data) {
             net_client_send(app->client, json, strlen(json));
             free(json);
             cJSON_Delete(root);
+            g_print("Saving canvas, data length: %zu\n", strlen(data));
             free(data);
         }
     }
@@ -597,12 +598,17 @@ static void on_net_message(const char *msg, size_t len, void *user_data) {
     (void)len;
     AppWidgets *app = (AppWidgets *)user_data;
     
-    g_print("RX: %s\n", msg); // Debug print raw message
+     g_print("RX: %.*s\n", (int)len, msg);  // 使用长度限制打印
+
+     if (!msg || len == 0) {
+        g_print("Warning: 空消息被接收\n");
+        return;
+    }
 
     // Check if it's a JSON message
     cJSON *root = cJSON_Parse(msg);
     if (!root) {
-        g_print("JSON Parse Failed\n");
+        g_print("JSON Parse Failed for message: %.*s\n", (int)len, msg);
         return;
     }
 

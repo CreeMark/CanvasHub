@@ -91,9 +91,15 @@ static void send_ws_frame(int fd, const char *payload) {
     char *frame = malloc(frame_len);
     if (!frame) return;
     
-    if (ws_build_frame(payload, len, frame, &frame_len) == 0) {
-        send(fd, frame, frame_len, MSG_NOSIGNAL);
+     if (ws_build_frame(payload, len, frame, &frame_len) == 0) {
+        ssize_t sent = send(fd, frame, frame_len, MSG_NOSIGNAL);
+        if (sent != (ssize_t)frame_len) {
+            g_print("Warning: Incomplete frame sent: %zd/%zu bytes\n", sent, frame_len);
+        }
+    } else {
+        g_print("Error:创建WebSocket帧失败\n");
     }
+
     free(frame);
 }
 
@@ -134,6 +140,8 @@ static void send_json_response(int fd, const char *type, const char *status, con
     
     send_ws_frame(fd, json);
     
+    g_print("Sending response: type=%s, status=%s\n", type, status);
+
     cJSON_Delete(root);
     free(json);
 }

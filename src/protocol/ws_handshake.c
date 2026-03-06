@@ -275,16 +275,24 @@ int ws_parse_frame(const char *in_frame, size_t in_len, char **out_payload, size
     }
     
     if (in_len < header_len + payload_len) return -2; // Incomplete
+
+    //Bug001 fix: 分配新内存存储解掩码后的数据
+    char *payload = malloc(payload_len + 1);
+    if (!payload) return -1;
     
-    *out_payload = (char *)(in_frame + header_len);
-    *out_payload_len = payload_len;
+    memcpy(payload, in_frame + header_len, payload_len);
     
-    // Unmask if needed
+    // 解掩码
     if (masked) {
         for (size_t i = 0; i < payload_len; i++) {
-            (*out_payload)[i] ^= mask[i % 4];
+            payload[i] ^= mask[i % 4];
         }
     }
     
+    payload[payload_len] = '\0'; // 添加终止符
+
+    *out_payload = payload;
+    *out_payload_len = payload_len;
+    g_print("Parsing frame: in_len=%zu, masked=%d, payload_len=%lu\n", in_len, masked, (unsigned long)payload_len);
     return header_len + payload_len;
 }

@@ -1,7 +1,7 @@
 # Makefile for Canvas Project
 
 CC = gcc
-CFLAGS = -std=c17 -Wall -Wextra -g -D_GNU_SOURCE
+CFLAGS = -std=c17 -Wall -Wextra -g -D_GNU_SOURCE -fstack-protector-strong
 INCLUDES = -Iinclude -Ideps/cJSON -Itests/unity
 
 # Libraries
