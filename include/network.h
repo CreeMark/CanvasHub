@@ -15,7 +15,9 @@ typedef void (*net_callback_t)(const void *data, size_t len, void *user_data);
 typedef struct net_client_s net_client_t;
 
 // 初始化网络客户端
-net_client_t *net_client_new(const char *url);
+// server_ip: 服务器 IP 地址，NULL 表示使用默认值 127.0.0.1
+// port: 服务器端口，<=0 表示使用默认值 8080
+net_client_t *net_client_new(const char *server_ip, int port);
 
 // 设置回调函数
 void net_client_set_callbacks(net_client_t *client, 

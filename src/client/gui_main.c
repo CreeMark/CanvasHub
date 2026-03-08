@@ -1135,12 +1135,38 @@ int main(int argc, char **argv) {
     widgets.state.line_width = 3.0;
     widgets.state.tool_type = TOOL_PEN;
 
+    // 解析命令行参数
+    const char *server_ip = "127.0.0.1";  // 默认本地地址
+    int server_port = 8080;                // 默认端口
+    
+    // 简单参数解析：./canvas_client [IP] [PORT]
+    if (argc > 1) {
+        server_ip = argv[1];
+        g_print("INFO: Server IP specified: %s\n", server_ip);
+    }
+    if (argc > 2) {
+        server_port = atoi(argv[2]);
+        if (server_port <= 0 || server_port > 65535) {
+            g_print("ERROR: Invalid port number: %s, using default 8080\n", argv[2]);
+            server_port = 8080;
+        } else {
+            g_print("INFO: Server port specified: %d\n", server_port);
+        }
+    }
+    
+    if (argc == 1) {
+        g_print("INFO: No arguments provided, using default server: %s:%d\n", 
+               server_ip, server_port);
+        g_print("INFO: Usage: %s [IP] [PORT]\n", argv[0]);
+    }
+
     char app_id[64];
     snprintf(app_id, sizeof(app_id), "org.canvas.client.pid%d", getpid());
     app = gtk_application_new(app_id, G_APPLICATION_FLAGS_NONE);
     g_signal_connect(app, "activate", G_CALLBACK(activate), &widgets);
     
-    widgets.client = net_client_new("ws://localhost:8080");
+    // 使用解析后的服务器地址和端口创建客户端
+    widgets.client = net_client_new(server_ip, server_port);
     if (widgets.client) {
         net_client_set_callbacks(widgets.client, (net_callback_t)on_net_connect, (net_callback_t)on_net_disconnect, (net_callback_t)on_net_message, &widgets);
         net_client_connect(widgets.client);

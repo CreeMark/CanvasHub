@@ -79,7 +79,14 @@ source schema.sql
 ./build/bin/canvas_server
 
 # 启动客户端 (另一个终端)
+# 方式 1: 默认连接本地服务器 (127.0.0.1:8080)
 ./build/bin/canvas_client
+
+# 方式 2: 连接远程服务器
+./build/bin/canvas_client 192.168.1.100
+
+# 方式 3: 指定服务器 IP 和端口
+./build/bin/canvas_client 192.168.1.100 9000
 ```
 
 ## 使用说明
@@ -90,11 +97,56 @@ source schema.sql
 4. **协作**: 其他用户加入同一房间后可实时看到绘画内容
 5. **保存**: 点击 Save 按钮将画布保存到服务器
 
+## 多机协作
+
+客户端支持连接远程服务器，实现多机实时协作：
+
+### 启动服务端
+
+在服务端机器上启动：
+
+```bash
+./build/bin/canvas_server
+```
+
+服务端默认绑定 `0.0.0.0:8080`，可接受来自任何 IP 的连接。
+
+### 启动客户端
+
+在多台客户端机器上分别运行：
+
+```bash
+# 本地机器
+./build/bin/canvas_client
+
+# 远程机器（假设服务器 IP 为 192.168.1.100）
+./build/bin/canvas_client 192.168.1.100
+```
+
+所有客户端连接到同一服务器后，可以：
+- 加入同一房间进行实时协作绘画
+- 实时聊天交流
+- 共享画布状态
+
 ## 开发指南
 
 ### 代码风格
 
 项目遵循 Linux Kernel Coding Style，使用 `.clang-format` 配置文件。
+
+### 命令行参数
+
+客户端支持命令行参数指定服务器地址：
+
+```bash
+# 格式
+./build/bin/canvas_client [IP] [PORT]
+
+# 示例
+./build/bin/canvas_client                    # 默认 127.0.0.1:8080
+./build/bin/canvas_client 192.168.1.100      # 指定 IP
+./build/bin/canvas_client 192.168.1.100 9000 # 指定 IP 和端口
+```
 
 ### 运行测试
 

@@ -21,6 +21,8 @@ typedef struct {
 
 struct net_client_s {
     int fd;
+    char server_ip[64];  // 服务器 IP 地址
+    int server_port;     // 服务器端口
     char buffer[BUFFER_SIZE];
     size_t buf_len;
     int connected;
@@ -37,10 +39,23 @@ struct net_client_s {
 
 static gboolean socket_io_callback(GIOChannel *source, GIOCondition condition, gpointer data);
 
-net_client_t *net_client_new(const char *url) {
-    (void)url; // URL parsing not implemented, assuming localhost:8080
+net_client_t *net_client_new(const char *server_ip, int port) {
     net_client_t *client = calloc(1, sizeof(net_client_t));
+    if (!client) return NULL;
+    
     client->fd = -1;
+    
+    // 设置服务器地址和端口
+    if (server_ip) {
+        strncpy(client->server_ip, server_ip, sizeof(client->server_ip) - 1);
+    } else {
+        strcpy(client->server_ip, "127.0.0.1");  // 默认本地地址
+    }
+    client->server_port = port > 0 ? port : 8080;  // 默认端口 8080
+    
+    g_print("INFO: Client initialized, will connect to %s:%d\n", 
+           client->server_ip, client->server_port);
+    
     return client;
 }
 
@@ -65,27 +80,35 @@ int net_client_connect(net_client_t *client) {
     
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(8080);
+    serv_addr.sin_port = htons(client->server_port);
     
-    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+    g_print("INFO: Connecting to %s:%d...\n", client->server_ip, client->server_port);
+    
+    if (inet_pton(AF_INET, client->server_ip, &serv_addr.sin_addr) <= 0) {
+        g_print("ERROR: Invalid server address: %s\n", client->server_ip);
         close(client->fd);
         return -1;
     }
     
     if (connect(client->fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        g_print("ERROR: Connection failed: %s\n", strerror(errno));
         close(client->fd);
         return -1;
     }
     
+    g_print("INFO: Connected to server successfully\n");
+    
     // Send WebSocket Handshake
-    const char *handshake = 
+    char handshake[512];
+    snprintf(handshake, sizeof(handshake),
         "GET / HTTP/1.1\r\n"
-        "Host: localhost:8080\r\n"
+        "Host: %s:%d\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
         "Sec-WebSocket-Version: 13\r\n"
-        "\r\n";
+        "\r\n",
+        client->server_ip, client->server_port);
         
     send(client->fd, handshake, strlen(handshake), 0);
     
