@@ -16,7 +16,7 @@
 
 #define MAX_EVENTS 64
 #define PORT 8080
-#define BUFFER_SIZE 8192
+#define BUFFER_SIZE 65536
 
 typedef struct {
     int fd;
@@ -160,13 +160,17 @@ static void send_ws_frame(int fd, const char *payload) {
 static void broadcast_room(int sender_fd, uint32_t room_id, const char *msg, size_t len) {
     if (room_id == 0) return;
     
-    // msg is already a payload, we need to wrap it in a frame for each client
-    // Or, more efficiently, wrap it once.
-    // However, broadcast_room receives the raw payload from handle_message?
-    // Wait, handle_message receives payload.
-    // So we need to re-wrap it.
+    // 计算正确的帧大小
+    size_t header_len;
+    if (len < 126) {
+        header_len = 2;
+    } else if (len < 65536) {
+        header_len = 4;
+    } else {
+        header_len = 10;
+    }
     
-    size_t frame_len = len + 10;
+    size_t frame_len = len + header_len;
     char *frame = malloc(frame_len);
     if (!frame) return;
     
@@ -490,6 +494,11 @@ int main(void) {
                 } else {
                 client->buf_len += count;
                 
+                // 检查缓冲区是否快满
+                if (client->buf_len >= (int)sizeof(client->buffer) - 1) {
+                    printf("WARNING: Buffer near full for client %d, buf_len=%d\n", fd, client->buf_len);
+                }
+                
                 // Process buffer
                 while (client->buf_len > 0) {
                     if (client->is_handshaked) {
@@ -515,7 +524,18 @@ int main(void) {
 }
 
 int mask_len = (buf[1] & 0x80) ? 4 : 0;
-if (client->buf_len < payload_start + mask_len + payload_len) {
+int total_frame_len = payload_start + mask_len + payload_len;
+
+// 检查帧是否超过缓冲区大小
+if (total_frame_len > (int)sizeof(client->buffer)) {
+    printf("ERROR: Frame too large (%d bytes), max buffer size: %zu. Disconnecting client %d\n", 
+           total_frame_len, sizeof(client->buffer), fd);
+    remove_client(fd);
+    close(fd);
+    break;
+}
+
+if (client->buf_len < total_frame_len) {
     // Wait for more data
     break;
 }
@@ -535,16 +555,15 @@ if (client->buf_len < payload_start + mask_len + payload_len) {
                          if (msg) {
                              memcpy(msg, buf + payload_start, payload_len);
                              msg[payload_len] = '\0';
-                             printf("Received WS Frame: %s\n", msg);
+                             printf("Received WS Frame (%d bytes): %.100s%s\n", payload_len, msg, payload_len > 100 ? "..." : "");
                              handle_message(client, msg, payload_len);
                              free(msg);
                          }
                          
                          // Move remaining data to front
-                         int frame_len = payload_start + payload_len;
-                         int remaining = client->buf_len - frame_len;
+                         int remaining = client->buf_len - total_frame_len;
                          if (remaining > 0) {
-                             memmove(client->buffer, client->buffer + frame_len, remaining);
+                             memmove(client->buffer, client->buffer + total_frame_len, remaining);
                          }
                          client->buf_len = remaining;
                          

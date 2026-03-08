@@ -212,8 +212,6 @@ int ws_is_handshake(const char *request) {
 }
 
 int ws_build_frame(const char *payload, size_t payload_len, char *out_frame, size_t *out_len) {
-    // Basic text frame, no masking (server -> client)
-    // FIN=1, Opcode=1 (text)
     out_frame[0] = 0x81;
     
     size_t header_len = 2;
@@ -226,9 +224,11 @@ int ws_build_frame(const char *payload, size_t payload_len, char *out_frame, siz
         header_len = 4;
     } else {
         out_frame[1] = 127;
-        // 64-bit length support omitted for brevity, assume < 4GB
-        // ...
-        return -1; // Too large for this simple implementation
+        uint64_t len64 = payload_len;
+        for (int i = 0; i < 8; i++) {
+            out_frame[2 + i] = (len64 >> (56 - i * 8)) & 0xFF;
+        }
+        header_len = 10;
     }
     
     if (*out_len < header_len + payload_len) return -1;

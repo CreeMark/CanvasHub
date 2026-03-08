@@ -109,13 +109,14 @@ static void on_login_clicked(GtkWidget *btn, gpointer data) {
     memset(&msg, 0, sizeof(msg));
     strncpy(msg.username, user, sizeof(msg.username)-1);
     strncpy(msg.password, pass, sizeof(msg.password)-1);
+    
     char *json = protocol_serialize_auth("login", &msg);
     if (json) {
-        g_print("Sending login: %s\n", json);
+        g_print("Sending login request for user: %s\n", user);
         if (net_client_send(app->client, json, strlen(json)) < 0) {
-             gtk_label_set_text(GTK_LABEL(app->login_status_label), "Send Failed: No Connection");
+            gtk_label_set_text(GTK_LABEL(app->login_status_label), "Send Failed: No Connection");
         } else {
-             gtk_label_set_text(GTK_LABEL(app->login_status_label), "Logging in...");
+            gtk_label_set_text(GTK_LABEL(app->login_status_label), "Logging in...");
         }
         free(json);
     }
@@ -141,7 +142,7 @@ static void on_register_submit(GtkWidget *btn, gpointer data) {
     
     char *json = protocol_serialize_auth("register", &msg);
     if (json) {
-        g_print("Sending register: %s\n", json);
+        g_print("Sending register request for user: %s, email: %s\n", user, email);
         if (net_client_send(app->client, json, strlen(json)) < 0) {
              gtk_label_set_text(GTK_LABEL(app->login_status_label), "Send Failed: No Connection");
         } else {

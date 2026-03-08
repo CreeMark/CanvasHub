@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "network.h"
 #include "protocol_ws.h"
 
@@ -260,34 +261,33 @@ int net_client_send(net_client_t *client, const void *data, size_t len) {
         return -1;
     }
     
-    // 动态分配缓冲区，避免栈溢出
-    size_t max_frame_len = len + 14; // WebSocket帧最大头部14字节
+    // 检查数据大小
+    if (len > 1024 * 1024) {
+        g_print("ERROR: 数据大小超过发送限制 (%zu bytes)\n", len);
+        return -1;
+    }
+
+    // 动态分配缓冲区：header(最大10字节) + mask(4字节) + payload
+    size_t max_frame_len = len + 14;
     char *frame = malloc(max_frame_len);
     if (!frame) {
         g_print("ERROR: Failed to allocate frame buffer (%zu bytes)\n", max_frame_len);
-        return -1;
-    }
-    
-    // 检查数据大小
-    if (len > 1024 * 1024) { // 1MB限制
-        g_print("ERROR: 数据大小超过发送限制 (%zu bytes)\n", len);
         return -1;
     }
 
     frame[0] = 0x81; // FIN, Text
     size_t header_len = 2;
     
+    // 根据RFC 6455，客户端必须设置掩码位
     if (len < 126) {
-        frame[1] = len; // Mask bit NOT set
-    } else if (len < 65536) {  // 注意：应该用<65536，不是<=
-        frame[1] = 126;
+        frame[1] = 0x80 | len; // Mask bit SET
+    } else if (len < 65536) {
+        frame[1] = 0x80 | 126; // Mask bit SET
         frame[2] = (len >> 8) & 0xFF;
         frame[3] = len & 0xFF;
         header_len = 4;
     } else {
-        // 支持大帧
-        frame[1] = 127;
-        // 64位长度
+        frame[1] = 0x80 | 127; // Mask bit SET
         uint64_t len64 = len;
         for (int i = 7; i >= 0; i--) {
             frame[2 + (7 - i)] = (len64 >> (i * 8)) & 0xFF;
@@ -295,20 +295,35 @@ int net_client_send(net_client_t *client, const void *data, size_t len) {
         header_len = 10;
     }
     
-    // 复制数据
-    memcpy(frame + header_len, data, len);
+    // 生成随机掩码（RFC 6455要求）
+    unsigned char mask[4];
+    srand((unsigned int)time(NULL) ^ (unsigned int)len);
+    for (int i = 0; i < 4; i++) {
+        mask[i] = rand() & 0xFF;
+    }
     
-    ssize_t sent = send(client->fd, frame, header_len + len, 0);
+    // 写入掩码
+    memcpy(frame + header_len, mask, 4);
+    header_len += 4;
+    
+    // 复制并掩码处理数据
+    const unsigned char *src = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) {
+        frame[header_len + i] = src[i] ^ mask[i % 4];
+    }
+    
+    size_t total_len = header_len + len;
+    ssize_t sent = send(client->fd, frame, total_len, 0);
     
     free(frame);
     
-    if (sent != (ssize_t)(header_len + len)) {
-        g_print("WARNING: Incomplete send: %zd/%zu bytes\n", sent, header_len + len);
+    if (sent != (ssize_t)total_len) {
+        g_print("WARNING: Incomplete send: %zd/%zu bytes\n", sent, total_len);
         return -1;
     }
     
-    g_print("INFO: Sent %zu bytes (payload: %zu, header: %zu)\n", 
-           header_len + len, len, header_len);
+    g_print("INFO: Sent %zu bytes (payload: %zu, header+mask: %zu)\n", 
+           total_len, len, header_len);
     
     return sent;
 }

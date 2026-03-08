@@ -7,10 +7,11 @@ INCLUDES = -Iinclude -Ideps/cJSON -Itests/unity
 # Libraries
 LIBS_GUI = $(shell pkg-config --libs gtk+-3.0 cairo)
 LIBS_DB = $(shell mysql_config --libs)
-# LIBS_NET = -lwebsockets
 LIBS_NET = 
 LIBS_M = -lm
-LIBS = $(LIBS_GUI) $(LIBS_DB) $(LIBS_NET) $(LIBS_M)
+LIBS_CRYPT = -lcrypt
+LIBS_PTHREAD = -lpthread
+LIBS = $(LIBS_GUI) $(LIBS_DB) $(LIBS_NET) $(LIBS_M) $(LIBS_CRYPT) $(LIBS_PTHREAD)
 
 CFLAGS += $(shell pkg-config --cflags gtk+-3.0 cairo)
 CFLAGS += $(shell mysql_config --cflags)
@@ -45,11 +46,12 @@ OBJS_CLIENT = $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS_CLIENT)))
 TARGET_SERVER = $(BIN_DIR)/canvas_server
 TARGET_CLIENT = $(BIN_DIR)/canvas_client
 TARGET_TEST = $(BIN_DIR)/test_protocol
+TARGET_BCRYPT_TEST = $(BIN_DIR)/test_bcrypt
 
 # VPATH for finding source files
 VPATH = $(SRC_DIR)/server $(SRC_DIR)/client $(SRC_DIR)/common $(SRC_DIR)/protocol $(SRC_DIR)/utils $(DEPS_DIR)/cJSON $(TEST_DIR) $(TEST_DIR)/unity
 
-.PHONY: all clean directories server client test_protocol
+.PHONY: all clean directories server client test_protocol test_bcrypt
 
 all: directories server client
 
@@ -74,6 +76,10 @@ $(OBJ_DIR)/%.o: %.c | directories
 test_protocol: directories
 	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET_TEST) $(SRCS_TEST) $(LIBS_M)
 	./$(TARGET_TEST)
+
+test_bcrypt: directories
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET_BCRYPT_TEST) $(TEST_DIR)/test_bcrypt.c $(SRC_DIR)/common/bcrypt_wrapper.c $(LIBS_M) $(LIBS_CRYPT)
+	./$(TARGET_BCRYPT_TEST)
 
 clean:
 	rm -rf $(BUILD_DIR)
