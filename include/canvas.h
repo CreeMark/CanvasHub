@@ -57,6 +57,11 @@ int canvas_get_command_count(void);
 // 检查是否有历史记录
 int canvas_has_history(void);        
 
+// Undo/Redo 操作级别接口
+void undo_redo_start_action(tool_type_t tool, uint32_t color, double line_width);
+void undo_redo_add_point(double x, double y);
+void undo_redo_end_action(void);
+
 #ifdef __cplusplus
 }
 #endif

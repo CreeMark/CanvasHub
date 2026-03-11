@@ -8,16 +8,8 @@
 #include "canvas.h"
 #include "protocol.h"
 #include "network.h"
-
-
-// External declarations for Undo/Redo
-const draw_cmd_t *undo_redo_undo(void);
-const draw_cmd_t *undo_redo_redo(void);
-void undo_redo_push(const draw_cmd_t *cmd);
-void undo_redo_init(int max_steps);
-void undo_redo_iterate(void (*cb)(const draw_cmd_t *, void *), void *user_data);
-char *undo_redo_serialize(void);
-void undo_redo_deserialize(const char *json);
+#include "undo_redo.h"
+#include "common/core_logic.h"
 
 typedef enum {
     APP_PHASE_LOGIN,
@@ -63,6 +55,11 @@ typedef struct {
     char username[64];
     uint32_t user_id;
     uint32_t current_room_id;
+    char server_ip[64];
+    int server_port;
+    
+    guint auto_save_timer;
+    int needs_save;
 } AppWidgets;
 
 // Forward declarations
@@ -70,6 +67,30 @@ static void build_login_ui(AppWidgets *app);
 static void build_lobby_ui(AppWidgets *app);
 static void build_canvas_ui(AppWidgets *app);
 static void repaint_all(AppWidgets *app);
+static void on_chat_history(chat_msg_t *messages, int count, void *user_data);
+static gboolean auto_save_canvas(gpointer user_data);
+
+// --- Auto Save ---
+
+static gboolean auto_save_canvas(gpointer user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    
+    g_print("DEBUG: auto_save_canvas - needs_save=%d, current_room_id=%u\n", 
+           app->needs_save, app->current_room_id);
+    
+    if (app->needs_save && app->current_room_id > 0) {
+        g_print("INFO: Auto-saving canvas...\n");
+        core_save_canvas();
+        app->needs_save = 0;
+    }
+    
+    return G_SOURCE_CONTINUE;
+}
+
+static void mark_needs_save(AppWidgets *app) {
+    g_print("DEBUG: mark_needs_save called, setting needs_save=1\n");
+    app->needs_save = 1;
+}
 
 // --- Network Callbacks ---
 
@@ -105,21 +126,8 @@ static void on_login_clicked(GtkWidget *btn, gpointer data) {
         return;
     }
 
-    auth_msg_t msg;
-    memset(&msg, 0, sizeof(msg));
-    strncpy(msg.username, user, sizeof(msg.username)-1);
-    strncpy(msg.password, pass, sizeof(msg.password)-1);
-    
-    char *json = protocol_serialize_auth("login", &msg);
-    if (json) {
-        g_print("Sending login request for user: %s\n", user);
-        if (net_client_send(app->client, json, strlen(json)) < 0) {
-            gtk_label_set_text(GTK_LABEL(app->login_status_label), "Send Failed: No Connection");
-        } else {
-            gtk_label_set_text(GTK_LABEL(app->login_status_label), "Logging in...");
-        }
-        free(json);
-    }
+    gtk_label_set_text(GTK_LABEL(app->login_status_label), "Logging in...");
+    core_login(user, pass);
 }
 
 static void on_register_submit(GtkWidget *btn, gpointer data) {
@@ -134,22 +142,8 @@ static void on_register_submit(GtkWidget *btn, gpointer data) {
         return;
     }
 
-    auth_msg_t msg;
-    memset(&msg, 0, sizeof(msg));
-    strncpy(msg.username, user, sizeof(msg.username)-1);
-    strncpy(msg.password, pass, sizeof(msg.password)-1);
-    strncpy(msg.email, email, sizeof(msg.email)-1);
-    
-    char *json = protocol_serialize_auth("register", &msg);
-    if (json) {
-        g_print("Sending register request for user: %s, email: %s\n", user, email);
-        if (net_client_send(app->client, json, strlen(json)) < 0) {
-             gtk_label_set_text(GTK_LABEL(app->login_status_label), "Send Failed: No Connection");
-        } else {
-             gtk_label_set_text(GTK_LABEL(app->login_status_label), "Registering...");
-        }
-        free(json);
-    }
+    gtk_label_set_text(GTK_LABEL(app->login_status_label), "Registering...");
+    core_register(user, pass, email);
 }
 
 static void on_switch_to_register(GtkWidget *btn, gpointer data) {
@@ -174,12 +168,8 @@ static void on_switch_to_login(GtkWidget *btn, gpointer data) {
 
 static void on_refresh_rooms_clicked(GtkWidget *btn, gpointer data) {
     (void)btn;
-    AppWidgets *app = (AppWidgets *)data;
-    char *json = protocol_serialize_cmd("list_rooms");
-    if (json) {
-        net_client_send(app->client, json, strlen(json));
-        free(json);
-    }
+    (void)data;
+    core_list_rooms();
 }
 
 static void on_create_room_clicked(GtkWidget *btn, gpointer data) {
@@ -188,17 +178,7 @@ static void on_create_room_clicked(GtkWidget *btn, gpointer data) {
     const char *name = gtk_entry_get_text(GTK_ENTRY(app->create_room_entry));
     if (strlen(name) == 0) return;
 
-    room_msg_t msg;
-    msg.room_id = 0;
-    strncpy(msg.name, name, sizeof(msg.name)-1);
-    strncpy(msg.description, "New Room", sizeof(msg.description)-1);
-    msg.owner_id = app->user_id;
-    
-    char *json = protocol_serialize_room("create_room", &msg);
-    if (json) {
-        net_client_send(app->client, json, strlen(json));
-        free(json);
-    }
+    core_create_room(name, "New Room");
 }
 
 static void on_join_room_clicked(GtkWidget *btn, gpointer data) {
@@ -211,17 +191,8 @@ static void on_join_room_clicked(GtkWidget *btn, gpointer data) {
     if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
         guint id;
         gtk_tree_model_get(model, &iter, 0, &id, -1);
-        
-        // Send join request
-        cJSON *root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "type", "join_room");
-        cJSON *d = cJSON_CreateObject();
-        cJSON_AddItemToObject(root, "data", d);
-        cJSON_AddNumberToObject(d, "room_id", id);
-        char *json = cJSON_PrintUnformatted(root);
-        net_client_send(app->client, json, strlen(json));
-        free(json);
-        cJSON_Delete(root);
+        app->current_room_id = id;
+        core_join_room(id);
     }
 }
 
@@ -313,64 +284,9 @@ static void on_load_local_clicked(GtkToolButton *btn, gpointer user_data) {
 
 static void on_save_clicked(GtkToolButton *btn, gpointer user_data) {
     (void)btn;
-    AppWidgets *app = (AppWidgets *)user_data;
-    
-    if (!app->client) {
-        g_print("ERROR: No client connection\n");
-        return;
-    }
-    
+    (void)user_data;
     g_print("INFO: Starting canvas save operation...\n");
-    
-    char *data = undo_redo_serialize();
-    if (!data) {
-        g_print("ERROR: undo_redo_serialize returned NULL\n");
-        return;
-    }
-    
-    g_print("INFO: Canvas data size: %zu bytes\n", strlen(data));
-    
-    // 检查数据是否有效
-    if (strlen(data) == 0 || strcmp(data, "[]") == 0) {
-        g_print("WARNING: No canvas data to save\n");
-        free(data);
-        return;
-    }
-    
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        g_print("ERROR: Failed to create JSON root\n");
-        free(data);
-        return;
-    }
-    
-    cJSON_AddStringToObject(root, "type", "save_canvas");
-    cJSON_AddStringToObject(root, "data", data);
-    
-    char *json = cJSON_PrintUnformatted(root);
-    if (!json) {
-        g_print("ERROR: Failed to print JSON\n");
-        cJSON_Delete(root);
-        free(data);
-        return;
-    }
-    
-    g_print("INFO: Total JSON size: %zu bytes\n", strlen(json));
-    
-    // 发送保存请求
-    int sent = net_client_send(app->client, json, strlen(json));
-    if (sent > 0) {
-        g_print("INFO: Save request sent successfully (%d bytes)\n", sent);
-    } else {
-        g_print("ERROR: Failed to send save request\n");
-    }
-    
-    // 清理资源
-    free(json);
-    cJSON_Delete(root);
-    free(data);
-    
-    g_print("INFO: Save request completed\n");
+    core_save_canvas();
 }
 
 static void on_tool_clicked(GtkToolButton *btn, gpointer user_data) {
@@ -406,10 +322,8 @@ static void on_undo_clicked(GtkToolButton *btn, gpointer user_data) {
     const draw_cmd_t *cmd = undo_redo_undo();
     if (cmd) {
         repaint_all(app);
-        if (app->client) {
-            char *json = protocol_serialize_cmd("undo");
-            if (json) { net_client_send(app->client, json, strlen(json)); free(json); }
-        }
+        core_send_undo();
+        mark_needs_save(app);
     }
 }
 
@@ -419,10 +333,8 @@ static void on_redo_clicked(GtkToolButton *btn, gpointer user_data) {
     const draw_cmd_t *cmd = undo_redo_redo();
     if (cmd) {
         repaint_all(app);
-        if (app->client) {
-            char *json = protocol_serialize_cmd("redo");
-            if (json) { net_client_send(app->client, json, strlen(json)); free(json); }
-        }
+        core_send_redo();
+        mark_needs_save(app);
     }
 }
 
@@ -436,10 +348,8 @@ static void clear_surface(GtkToolButton *btn, gpointer user_data) {
         cairo_destroy(cr);
         gtk_widget_queue_draw(app->drawing_area);
         undo_redo_init(50);
-        if (app->client) {
-            char *json = protocol_serialize_cmd("clear");
-            if (json) { net_client_send(app->client, json, strlen(json)); free(json); }
-        }
+        core_send_clear();
+        mark_needs_save(app);
     }
 }
 
@@ -469,25 +379,17 @@ static void draw_brush(GtkWidget *widget, double x, double y, AppWidgets *app) {
     cairo_destroy(cr);
     gtk_widget_queue_draw(widget);
 
-    // Create command for local undo/redo history
-    draw_cmd_t cmd;
-    cmd.tool = app->state.tool_type;
-    cmd.color = (uint32_t)((int)(app->state.color.r * 255) << 16) | ((int)(app->state.color.g * 255) << 8) | (int)(app->state.color.b * 255);
-    cmd.line_width = app->state.line_width;
-    cmd.point_count = 2;
-    cmd.points = malloc(sizeof(point_t) * 2);
-    if (cmd.points) {
-        cmd.points[0].x = app->state.x; cmd.points[0].y = app->state.y;
-        cmd.points[1].x = x; cmd.points[1].y = y;
-        cmd.layer_id = 0;
-        undo_redo_push(&cmd);
-        free(cmd.points);
-    }
+    // 添加点到当前操作
+    undo_redo_add_point(x, y);
 
     if (app->client) {
         draw_msg_t msg;
         msg.tool_type = app->state.tool_type;
-        msg.color = cmd.color;
+        if (app->state.tool_type == TOOL_ERASER) {
+            msg.color = 0xFFFFFF;
+        } else {
+            msg.color = (uint32_t)((int)(app->state.color.r * 255) << 16) | ((int)(app->state.color.g * 255) << 8) | (int)(app->state.color.b * 255);
+        }
         msg.width = app->state.line_width;
         msg.point_count = 2;
         msg.points = malloc(sizeof(point_t) * 2);
@@ -496,11 +398,7 @@ static void draw_brush(GtkWidget *widget, double x, double y, AppWidgets *app) {
             msg.points[0].y = app->state.y;
             msg.points[1].x = x;
             msg.points[1].y = y;
-            char *json = protocol_serialize_draw(&msg);
-            if (json) { 
-                net_client_send(app->client, json, strlen(json)); 
-                free(json); 
-            }
+            core_send_draw(&msg);
             free(msg.points);
         }
     }
@@ -516,6 +414,14 @@ static gboolean button_press_event_cb(GtkWidget *widget, GdkEventButton *event, 
         app->state.x = event->x;
         app->state.y = event->y;
         app->state.is_drawing = 1;
+        uint32_t color;
+        if (app->state.tool_type == TOOL_ERASER) {
+            color = 0xFFFFFF;
+        } else {
+            color = (uint32_t)((int)(app->state.color.r * 255) << 16) | ((int)(app->state.color.g * 255) << 8) | (int)(app->state.color.b * 255);
+        }
+        undo_redo_start_action(app->state.tool_type, color, app->state.line_width);
+        undo_redo_add_point(app->state.x, app->state.y);
     }
     return TRUE;
 }
@@ -533,6 +439,8 @@ static gboolean button_release_event_cb(GtkWidget *widget, GdkEventButton *event
     AppWidgets *app = (AppWidgets *)data;
     if (event->button == GDK_BUTTON_PRIMARY) {
         app->state.is_drawing = 0;
+        undo_redo_end_action();
+        mark_needs_save(app);
     }
     return TRUE;
 }
@@ -568,19 +476,19 @@ static void on_chat_send(GtkWidget *widget, gpointer data) {
     const char *text = gtk_entry_get_text(GTK_ENTRY(app->chat_entry));
     if (strlen(text) == 0) return;
     
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
-    char msg[512];
-    snprintf(msg, sizeof(msg), "Me: %s\n", text);
+    char msg[768];
+    snprintf(msg, sizeof(msg), "Me [%s]:\n  %s\n", time_str, text);
     gtk_text_buffer_insert(app->chat_buffer, &end, msg, -1);
     
     if (app->client) {
-        chat_msg_t chat_msg;
-        strncpy(chat_msg.sender, app->username, sizeof(chat_msg.sender)-1);
-        strncpy(chat_msg.content, text, sizeof(chat_msg.content)-1);
-        chat_msg.timestamp = 0;
-        char *json = protocol_serialize_chat(&chat_msg);
-        if (json) { net_client_send(app->client, json, strlen(json)); free(json); }
+        core_send_chat(text);
     }
     gtk_entry_set_text(GTK_ENTRY(app->chat_entry), "");
 }
@@ -616,24 +524,68 @@ static gboolean delayed_repaint(gpointer user_data) {
     return FALSE; // 只执行一次
 }
 
-// 确保repaint_all函数在surface未初始化时能正常工作
+static gboolean batch_repaint(gpointer user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    static int current_cmd = 0;
+    static guint idle_id = 0;
+    const int batch_size = 10;
+    
+    if (!app->surface) {
+        current_cmd = 0;
+        idle_id = 0;
+        return FALSE;
+    }
+    
+    int total_cmds = canvas_get_command_count();
+    
+    if (current_cmd == 0 && total_cmds == 0) {
+        cairo_t *cr = cairo_create(app->surface);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        gtk_widget_queue_draw(app->drawing_area);
+        idle_id = 0;
+        g_print("INFO: Batch repaint completed (empty canvas)\n");
+        return FALSE;
+    }
+    
+    int end_cmd = current_cmd + batch_size;
+    if (end_cmd > total_cmds) {
+        end_cmd = total_cmds;
+    }
+    
+    if (current_cmd == 0) {
+        cairo_t *cr = cairo_create(app->surface);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+    }
+    
+    g_print("INFO: Batch repaint: processing commands %d-%d of %d\n", current_cmd, end_cmd-1, total_cmds);
+    
+    undo_redo_iterate_range(current_cmd, batch_size, repaint_cmd_cb, app);
+    gtk_widget_queue_draw(app->drawing_area);
+    
+    current_cmd = end_cmd;
+    
+    if (current_cmd >= total_cmds) {
+        current_cmd = 0;
+        idle_id = 0;
+        g_print("INFO: Batch repaint completed\n");
+        return FALSE;
+    }
+    
+    return TRUE;
+}
+
 static void repaint_all(AppWidgets *app) {
     if (!app->surface) {
         g_print("WARNING: Cannot repaint, surface is NULL\n");
         return;
     }
     
-    cairo_t *cr = cairo_create(app->surface);
-    cairo_set_source_rgb(cr, 1, 1, 1);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    
-    undo_redo_iterate(repaint_cmd_cb, app);
-    gtk_widget_queue_draw(app->drawing_area);
-    
-    // 使用正确的函数获取命令数量
-    int count = canvas_get_command_count();
-    g_print("INFO: Canvas repainted with %d commands\n", count);
+    g_print("INFO: Starting batch repaint\n");
+    g_idle_add(batch_repaint, app);
 }
 
 // --- Message Handler ---
@@ -654,214 +606,253 @@ static gboolean update_ui_idle(gpointer user_data) {
     return FALSE; // Remove source
 }
 
-static void on_net_message(const char *msg, size_t len, void *user_data) {
-    (void)len;
+// 核心逻辑回调函数
+static void on_login_success(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    app->username[0] = '\0';
+    strncpy(app->username, gtk_entry_get_text(GTK_ENTRY(app->login_entry_user)), sizeof(app->username)-1);
+    
+    g_print("Login OK, switching to Lobby...\n");
+    
+    // Ensure phase is updated BEFORE building UI
+    app->phase = APP_PHASE_LOBBY;
+    
+    // Use g_idle_add to update UI safely
+    g_idle_add(update_ui_idle, app);
+}
+
+static void on_login_failure(const char *error, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    g_print("Login Error: %s\n", error);
+    gtk_label_set_text(GTK_LABEL(app->login_status_label), error);
+}
+
+static void on_register_success(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    // Switch back to login view automatically for better UX
+    on_switch_to_login(NULL, app);
+    gtk_label_set_text(GTK_LABEL(app->login_status_label), "Registered! Please Login.");
+}
+
+static void on_register_failure(const char *error, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    g_print("Register Error: %s\n", error);
+    gtk_label_set_text(GTK_LABEL(app->login_status_label), error);
+}
+
+static void on_room_list(room_list_msg_t *list, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    gtk_list_store_clear(app->room_list_store);
+    
+    for (int i = 0; i < list->count; i++) {
+        room_msg_t *room = &list->rooms[i];
+        GtkTreeIter iter;
+        gtk_list_store_append(app->room_list_store, &iter);
+        gtk_list_store_set(app->room_list_store, &iter, 0, room->room_id, 1, room->name, -1);
+    }
+}
+
+static void on_join_room_success(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    undo_redo_init(50);
+    app->needs_save = 0;
+    g_print("DEBUG: join_room_resp OK, phase set to CANVAS\n");
+    app->phase = APP_PHASE_CANVAS;
+    g_idle_add(update_ui_idle, app);
+
+    g_print("INFO: Waiting for canvas data...\n");
+    
+    if (app->auto_save_timer == 0) {
+        app->auto_save_timer = g_timeout_add(5000, auto_save_canvas, app);
+        g_print("INFO: Auto-save timer started (5 second interval)\n");
+    }
+}
+
+static void on_save_canvas_success(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    g_print("INFO: Canvas saved successfully!\n");
+}
+
+static void on_save_canvas_failure(const char *error, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    g_print("ERROR: Canvas save failed: %s\n", error);
+}
+
+static gboolean on_window_close(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
     AppWidgets *app = (AppWidgets *)user_data;
     
+    g_print("DEBUG: on_window_close - needs_save=%d, current_room_id=%u\n", 
+           app->needs_save, app->current_room_id);
+    
+    if (app->needs_save && app->current_room_id > 0) {
+        g_print("INFO: Saving canvas before exit...\n");
+        core_save_canvas();
+        app->needs_save = 0;
+        
+        if (app->client) {
+            g_print("INFO: Waiting for save to complete...\n");
+            g_usleep(500000);
+        }
+    }
+    
+    if (app->auto_save_timer > 0) {
+        g_source_remove(app->auto_save_timer);
+        app->auto_save_timer = 0;
+    }
+    
+    return FALSE;
+}
+
+static void on_draw(draw_msg_t *msg, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    if (!app->surface) {
+        g_print("WARNING: on_draw called but surface is NULL\n");
+        return;
+    }
+    cairo_t *cr = cairo_create(app->surface);
+    if (msg->tool_type == TOOL_ERASER) cairo_set_source_rgb(cr, 1, 1, 1);
+    else cairo_set_source_rgb(cr, ((msg->color >> 16) & 0xFF)/255.0, ((msg->color >> 8) & 0xFF)/255.0, (msg->color & 0xFF)/255.0);
+    cairo_set_line_width(cr, msg->width);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    if (msg->point_count > 1 && msg->points) {
+        cairo_move_to(cr, msg->points[0].x, msg->points[0].y);
+        for (size_t i = 1; i < msg->point_count; i++) cairo_line_to(cr, msg->points[i].x, msg->points[i].y);
+        cairo_stroke(cr);
+    }
+    cairo_destroy(cr);
+    gtk_widget_queue_draw(app->drawing_area);
+}
+
+static void on_chat(chat_msg_t *msg, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
+    
+    time_t now = msg->timestamp > 0 ? (time_t)msg->timestamp : time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    char display_msg[768];
+    if (strcmp(msg->sender, app->username) == 0) {
+        snprintf(display_msg, sizeof(display_msg), "Me [%s]:\n  %s\n", time_str, msg->content);
+    } else {
+        snprintf(display_msg, sizeof(display_msg), "%.32s [%s]:\n  %s\n", msg->sender, time_str, msg->content);
+    }
+    gtk_text_buffer_insert(app->chat_buffer, &end, display_msg, -1);
+}
+
+static void on_undo(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    if (!app->surface) return;
+    const draw_cmd_t *cmd = undo_redo_undo();
+    if (cmd) repaint_all(app);
+}
+
+static void on_redo(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    if (!app->surface) return;
+    const draw_cmd_t *cmd = undo_redo_redo();
+    if (cmd) repaint_all(app);
+}
+
+static void on_clear(void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    if (app->surface) {
+        cairo_t *cr = cairo_create(app->surface);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        gtk_widget_queue_draw(app->drawing_area);
+        undo_redo_init(50);
+    }
+}
+
+static void on_load_canvas(const char *data, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    g_print("INFO: Received load_canvas, data length: %zu\n", strlen(data));
+    
+    if (strlen(data) == 0 || strcmp(data, "[]") == 0) {
+        g_print("INFO: No canvas data to load\n");
+        if (app->surface) {
+            cairo_t *cr = cairo_create(app->surface);
+            cairo_set_source_rgb(cr, 1, 1, 1);
+            cairo_paint(cr);
+            cairo_destroy(cr);
+        }
+        undo_redo_init(50);
+        if (app->drawing_area && GTK_IS_WIDGET(app->drawing_area)) {
+            gtk_widget_queue_draw(app->drawing_area);
+        }
+    } else {
+        g_print("INFO: Deserializing canvas data...\n");
+        undo_redo_deserialize(data);
+        int cmd_count = canvas_get_command_count();
+        g_print("INFO: Canvas data deserialized, command count: %d\n", cmd_count);
+        
+        if (app->surface) {
+            g_print("INFO: Repainting canvas with %d commands\n", cmd_count);
+            repaint_all(app);
+        } else {
+            g_print("WARNING: Surface not ready, scheduling delayed repaint\n");
+            g_timeout_add(200, (GSourceFunc)delayed_repaint, app);
+        }
+    }
+}
+
+static void on_user_joined(const char *username, uint32_t user_id, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    (void)user_id;
+    
+    if (app->chat_buffer) {
+        GtkTextIter end;
+        gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
+        
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char time_str[16];
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+        
+        char notification[256];
+        snprintf(notification, sizeof(notification), "[System] [%s]:\n  %s joined the room.\n", time_str, username);
+        gtk_text_buffer_insert(app->chat_buffer, &end, notification, -1);
+    }
+}
+
+static void on_chat_history(chat_msg_t *messages, int count, void *user_data) {
+    AppWidgets *app = (AppWidgets *)user_data;
+    
+    if (!app->chat_buffer || !messages || count <= 0) return;
+    
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
+    
+    gtk_text_buffer_insert(app->chat_buffer, &end, "--- Chat History ---\n", -1);
+    
+    for (int i = 0; i < count; i++) {
+        time_t msg_time = messages[i].timestamp > 0 ? (time_t)messages[i].timestamp : time(NULL);
+        struct tm *tm_info = localtime(&msg_time);
+        char time_str[16];
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+        
+        char display_msg[768];
+        if (strcmp(messages[i].sender, app->username) == 0) {
+            snprintf(display_msg, sizeof(display_msg), "Me [%s]:\n  %s\n", time_str, messages[i].content);
+        } else {
+            snprintf(display_msg, sizeof(display_msg), "%.32s [%s]:\n  %s\n", messages[i].sender, time_str, messages[i].content);
+        }
+        gtk_text_buffer_insert(app->chat_buffer, &end, display_msg, -1);
+        gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
+    }
+    
+    gtk_text_buffer_insert(app->chat_buffer, &end, "-------------------\n", -1);
+}
+
+static void on_net_message(const char *msg, size_t len, void *user_data) {
+    (void)user_data;
     g_print("RX: %.*s\n", (int)len, msg);
-    g_print("DEBUG: on_net_message: phase=%d, app=%p\n", app->phase, (void*)app);
-
-    if (!msg || len == 0) {
-        g_print("Warning: 空消息被接收\n");
-        return;
-    }
-
-    // Check if it's a JSON message
-    cJSON *root = cJSON_Parse(msg);
-    if (!root) {
-        g_print("JSON Parse Failed for message: %.*s\n", (int)len, msg);
-        return;
-    }
-
-    cJSON *type = cJSON_GetObjectItem(root, "type");
-    if (!cJSON_IsString(type)) { cJSON_Delete(root); return; }
-
-    // Debug print
-    g_print("Msg Type: %s\n", type->valuestring);
-
-    if (app->phase == APP_PHASE_LOGIN) {
-        if (strcmp(type->valuestring, "login_resp") == 0) {
-            cJSON *status = cJSON_GetObjectItem(root, "status");
-            g_print("Login Status: %s\n", status ? status->valuestring : "null");
-            
-            if (status && strcmp(status->valuestring, "ok") == 0) {
-                app->username[0] = '\0';
-                strncpy(app->username, gtk_entry_get_text(GTK_ENTRY(app->login_entry_user)), sizeof(app->username)-1);
-                
-                g_print("Login OK, switching to Lobby...\n");
-                
-                // Ensure phase is updated BEFORE building UI
-                app->phase = APP_PHASE_LOBBY;
-                
-                // Use g_idle_add to update UI safely
-                g_idle_add(update_ui_idle, app);
-            } else {
-                cJSON *msg_item = cJSON_GetObjectItem(root, "message");
-                const char *err_msg = msg_item && msg_item->valuestring ? msg_item->valuestring : "Login Failed";
-                g_print("Login Error: %s\n", err_msg);
-                
-                gtk_label_set_text(GTK_LABEL(app->login_status_label), err_msg);
-            }
-        } else if (strcmp(type->valuestring, "register_resp") == 0) {
-            cJSON *status = cJSON_GetObjectItem(root, "status");
-            g_print("Register Status: %s\n", status ? status->valuestring : "null");
-
-            if (status && strcmp(status->valuestring, "ok") == 0) {
-                // Switch back to login view automatically for better UX
-                on_switch_to_login(NULL, app);
-                gtk_label_set_text(GTK_LABEL(app->login_status_label), "Registered! Please Login.");
-            } else {
-                cJSON *msg_item = cJSON_GetObjectItem(root, "message");
-                const char *err_msg = msg_item && msg_item->valuestring ? msg_item->valuestring : "Registration Failed";
-                g_print("Register Error: %s\n", err_msg);
-                gtk_label_set_text(GTK_LABEL(app->login_status_label), err_msg);
-            }
-        }
-    } else if (app->phase == APP_PHASE_LOBBY) {
-        if (strcmp(type->valuestring, "room_list") == 0) {
-            gtk_list_store_clear(app->room_list_store);
-            cJSON *data = cJSON_GetObjectItem(root, "data");
-            cJSON *item = NULL;
-            cJSON_ArrayForEach(item, data) {
-                cJSON *id = cJSON_GetObjectItem(item, "id");
-                cJSON *name = cJSON_GetObjectItem(item, "name");
-                if (id && name) {
-                    GtkTreeIter iter;
-                    gtk_list_store_append(app->room_list_store, &iter);
-                    gtk_list_store_set(app->room_list_store, &iter, 0, (guint)id->valuedouble, 1, name->valuestring, -1);
-                }
-            }
-        } else if (strcmp(type->valuestring, "create_room_resp") == 0) {
-            on_refresh_rooms_clicked(NULL, app); // Refresh list
-        } else if (strcmp(type->valuestring, "join_room_resp") == 0) {
-            cJSON *status = cJSON_GetObjectItem(root, "status");
-            g_print("DEBUG: join_room_resp received, phase before=%d\n", app->phase);
-            if (status && strcmp(status->valuestring, "ok") == 0) {
-                // 在切换界面和加载任何数据前，清空本地绘制历史
-                undo_redo_init(50);
-                g_print("DEBUG: join_room_resp OK, phase before set=%d\n", app->phase);
-                app->phase = APP_PHASE_CANVAS;
-                g_print("DEBUG: join_room_resp OK, phase set to CANVAS (%d)\n", app->phase);
-                g_idle_add(update_ui_idle, app);
-
-                // 设置一个标志，表示正在等待画布数据
-                g_print("INFO: Waiting for canvas data...\n");
-            }
-        }
-    }
-    // 处理 CANVAS 阶段的消息（独立于 LOGIN 和 LOBBY 分支）
-    if (app->phase == APP_PHASE_CANVAS) {
-        g_print("DEBUG: APP_PHASE_CANVAS branch, type=%s\n", type->valuestring);
-        if (strcmp(type->valuestring, "draw") == 0) {
-            draw_msg_t draw_msg;
-            if (protocol_deserialize_draw(msg, &draw_msg) == 0) {
-                cairo_t *cr = cairo_create(app->surface);
-                if (draw_msg.tool_type == TOOL_ERASER) cairo_set_source_rgb(cr, 1, 1, 1);
-                else cairo_set_source_rgb(cr, ((draw_msg.color >> 16) & 0xFF)/255.0, ((draw_msg.color >> 8) & 0xFF)/255.0, (draw_msg.color & 0xFF)/255.0);
-                cairo_set_line_width(cr, draw_msg.width);
-                cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-                cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-                if (draw_msg.point_count > 1 && draw_msg.points) {
-                    cairo_move_to(cr, draw_msg.points[0].x, draw_msg.points[0].y);
-                    for (size_t i = 1; i < draw_msg.point_count; i++) cairo_line_to(cr, draw_msg.points[i].x, draw_msg.points[i].y);
-                    cairo_stroke(cr);
-                }
-                cairo_destroy(cr);
-                gtk_widget_queue_draw(app->drawing_area);
-                
-                draw_cmd_t cmd;
-                cmd.tool = (tool_type_t)draw_msg.tool_type;
-                cmd.color = draw_msg.color;
-                cmd.line_width = draw_msg.width;
-                cmd.point_count = draw_msg.point_count;
-                cmd.points = (point_t *)draw_msg.points; 
-                cmd.layer_id = 0;
-                undo_redo_push(&cmd);
-                protocol_free_draw_msg(&draw_msg);
-            }
-        } else if (strcmp(type->valuestring, "chat") == 0) {
-            chat_msg_t chat_msg;
-            if (protocol_deserialize_chat(msg, &chat_msg) == 0) {
-                if (strcmp(chat_msg.sender, app->username) != 0) {
-                    GtkTextIter end;
-                    gtk_text_buffer_get_end_iter(app->chat_buffer, &end);
-                    char display_msg[512];
-                    snprintf(display_msg, sizeof(display_msg), "%.32s: %.440s\n", chat_msg.sender, chat_msg.content);
-                    gtk_text_buffer_insert(app->chat_buffer, &end, display_msg, -1);
-                }
-            }
-        } else if (strcmp(type->valuestring, "undo") == 0) {
-            const draw_cmd_t *cmd = undo_redo_undo();
-            if (cmd) repaint_all(app);
-        } else if (strcmp(type->valuestring, "redo") == 0) {
-            const draw_cmd_t *cmd = undo_redo_redo();
-            if (cmd) repaint_all(app);
-        } else if (strcmp(type->valuestring, "clear") == 0) {
-            if (app->surface) {
-                cairo_t *cr = cairo_create(app->surface);
-                cairo_set_source_rgb(cr, 1, 1, 1);
-                cairo_paint(cr);
-                cairo_destroy(cr);
-                gtk_widget_queue_draw(app->drawing_area);
-                undo_redo_init(50);
-            }
-        } else if (strcmp(type->valuestring, "load_canvas") == 0) {
-            g_print("DEBUG: load_canvas message received, phase=%d\n", app->phase);
-            cJSON *data = cJSON_GetObjectItem(root, "data");
-            g_print("DEBUG: data=%p, type=%d, is_string=%d\n", (void*)data, data ? data->type : -1, data ? cJSON_IsString(data) : -1);
-            if (data && cJSON_IsString(data)) {
-                size_t data_len = strlen(data->valuestring);
-                g_print("INFO: Received load_canvas, data length: %zu, first 50 chars: %.50s\n", data_len, data->valuestring);
-                
-                // 检查数据是否为空
-                if (data_len == 0 || strcmp(data->valuestring, "[]") == 0) {
-                    g_print("INFO: No canvas data to load\n");
-                    // 清空画布
-                    if (app->surface) {
-                        cairo_t *cr = cairo_create(app->surface);
-                        cairo_set_source_rgb(cr, 1, 1, 1);
-                        cairo_paint(cr);
-                        cairo_destroy(cr);
-                    }
-                    undo_redo_init(50);
-                    gtk_widget_queue_draw(app->drawing_area);
-                } else {
-                    // 反序列化数据
-                    g_print("INFO: Deserializing canvas data...\n");
-                    undo_redo_deserialize(data->valuestring);
-                    int cmd_count = canvas_get_command_count();
-                    g_print("INFO: Canvas data deserialized, command count: %d\n", cmd_count);
-                    
-                    // 重绘画布
-                    if (app->surface) {
-                        g_print("INFO: Repainting canvas with %d commands\n", cmd_count);
-                        repaint_all(app);
-                    } else {
-                        g_print("WARNING: Surface not ready, scheduling delayed repaint\n");
-                        g_timeout_add(200, (GSourceFunc)delayed_repaint, app);
-                    }
-                }
-            } else {
-                g_print("ERROR: load_canvas data field is missing or not a string!\n");
-            }
-        } else if (strcmp(type->valuestring, "save_canvas_resp") == 0) {
-            cJSON *status = cJSON_GetObjectItem(root, "status");
-            cJSON *message = cJSON_GetObjectItem(root, "message");
-
-            if (status && message) {
-                g_print("INFO: Save response: status=%s, message=%s\n", 
-                       status->valuestring, message->valuestring);
-                
-                // 在界面上显示保存结果
-                if (strcmp(status->valuestring, "ok") == 0) {
-                    g_print("INFO: Canvas saved successfully!\n");
-                } else {
-                    g_print("ERROR: Canvas save failed: %s\n", message->valuestring);
-                }
-            }
-        }
-    }
-    cJSON_Delete(root);
+    core_handle_message(msg, len);
 }
 
 // --- UI Builders ---
@@ -1119,11 +1110,43 @@ static void activate(GtkApplication *app, gpointer user_data) {
     widgets->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(widgets->window), "Canvas Client (Linux)");
     gtk_window_set_default_size(GTK_WINDOW(widgets->window), 800, 600);
+    
+    g_signal_connect(widgets->window, "delete-event", G_CALLBACK(on_window_close), widgets);
 
     widgets->main_container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(widgets->window), widgets->main_container);
 
     build_login_ui(widgets);
+    
+    core_init();
+    core_set_callbacks(
+        on_login_success,
+        on_login_failure,
+        on_register_success,
+        on_register_failure,
+        on_room_list,
+        on_join_room_success,
+        on_save_canvas_success,
+        on_save_canvas_failure,
+        on_draw,
+        on_chat,
+        on_undo,
+        on_redo,
+        on_clear,
+        on_load_canvas,
+        on_user_joined,
+        on_chat_history,
+        widgets
+    );
+    
+    if (!widgets->client) {
+        widgets->client = net_client_new(widgets->server_ip, widgets->server_port);
+        if (widgets->client) {
+            net_client_set_callbacks(widgets->client, (net_callback_t)on_net_connect, (net_callback_t)on_net_disconnect, (net_callback_t)on_net_message, widgets);
+            core_set_client(widgets->client);
+            net_client_connect(widgets->client);
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1165,12 +1188,9 @@ int main(int argc, char **argv) {
     app = gtk_application_new(app_id, G_APPLICATION_FLAGS_NONE);
     g_signal_connect(app, "activate", G_CALLBACK(activate), &widgets);
     
-    // 使用解析后的服务器地址和端口创建客户端
-    widgets.client = net_client_new(server_ip, server_port);
-    if (widgets.client) {
-        net_client_set_callbacks(widgets.client, (net_callback_t)on_net_connect, (net_callback_t)on_net_disconnect, (net_callback_t)on_net_message, &widgets);
-        net_client_connect(widgets.client);
-    }
+    strncpy(widgets.server_ip, server_ip, sizeof(widgets.server_ip) - 1);
+    widgets.server_ip[sizeof(widgets.server_ip) - 1] = '\0';
+    widgets.server_port = server_port;
     
     status = g_application_run(G_APPLICATION(app), argc, argv);
     

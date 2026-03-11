@@ -10,12 +10,15 @@
 #include <time.h>
 #include "network.h"
 #include "protocol_ws.h"
+#include "protocol/large_frame.h"
 
 #define BUFFER_SIZE 16384
 
 typedef struct {
     int expecting_big_frame;
     size_t expected_frame_size;
+    fragment_assembler_t *assembler; // 分片组装器
+    uint64_t last_operation_id; // 最后处理的操作ID
 } client_extra_state_t;
 
 
@@ -278,25 +281,38 @@ static gboolean socket_io_callback(GIOChannel *source, GIOCondition condition, g
 }
 
 int net_client_send(net_client_t *client, const void *data, size_t len) {
-    if (!client || client->fd == -1 || !client->connected) 
+    g_print("DEBUG: net_client_send called - client=%p, data=%p, len=%zu\n", (void*)client, data, len);
+    
+    if (!client) {
+        g_print("ERROR: net_client_send - client is NULL\n");
+        return -1;
+    }
+    
+    g_print("DEBUG: client->fd=%d, client->connected=%d\n", client->fd, client->connected);
+    
+    if (client->fd == -1 || !client->connected) 
     {
         g_print("ERROR: 无法发送, 客户端未连接\n");
         return -1;
     }
     
     // 检查数据大小
-    if (len > 1024 * 1024) {
+    if (len > 1024 * 1024 * 10) { // 10MB 上限
         g_print("ERROR: 数据大小超过发送限制 (%zu bytes)\n", len);
         return -1;
     }
 
+    // 所有数据都使用 WebSocket 帧发送
     // 动态分配缓冲区：header(最大10字节) + mask(4字节) + payload
     size_t max_frame_len = len + 14;
+    g_print("DEBUG: Allocating frame buffer: %zu bytes\n", max_frame_len);
+    
     char *frame = malloc(max_frame_len);
     if (!frame) {
         g_print("ERROR: Failed to allocate frame buffer (%zu bytes)\n", max_frame_len);
         return -1;
     }
+    g_print("DEBUG: Frame buffer allocated at %p\n", (void*)frame);
 
     frame[0] = 0x81; // FIN, Text
     size_t header_len = 2;
@@ -318,6 +334,8 @@ int net_client_send(net_client_t *client, const void *data, size_t len) {
         header_len = 10;
     }
     
+    g_print("DEBUG: Header length: %zu\n", header_len);
+    
     // 生成随机掩码（RFC 6455要求）
     unsigned char mask[4];
     srand((unsigned int)time(NULL) ^ (unsigned int)len);
@@ -329,6 +347,8 @@ int net_client_send(net_client_t *client, const void *data, size_t len) {
     memcpy(frame + header_len, mask, 4);
     header_len += 4;
     
+    g_print("DEBUG: Copying and masking %zu bytes of data\n", len);
+    
     // 复制并掩码处理数据
     const unsigned char *src = (const unsigned char *)data;
     for (size_t i = 0; i < len; i++) {
@@ -336,19 +356,24 @@ int net_client_send(net_client_t *client, const void *data, size_t len) {
     }
     
     size_t total_len = header_len + len;
-    ssize_t sent = send(client->fd, frame, total_len, 0);
+    g_print("DEBUG: Total frame length: %zu, sending...\n", total_len);
     
-    free(frame);
-    
-    if (sent != (ssize_t)total_len) {
-        g_print("WARNING: Incomplete send: %zd/%zu bytes\n", sent, total_len);
-        return -1;
+    // 分批发送大数据，避免阻塞
+    size_t sent_total = 0;
+    while (sent_total < total_len) {
+        ssize_t sent = send(client->fd, frame + sent_total, total_len - sent_total, 0);
+        if (sent <= 0) {
+            g_print("ERROR: Send failed at %zu/%zu bytes (errno=%d)\n", sent_total, total_len, errno);
+            free(frame);
+            return -1;
+        }
+        sent_total += sent;
+        g_print("DEBUG: Sent %zd bytes, total: %zu/%zu\n", sent, sent_total, total_len);
     }
     
-    g_print("INFO: Sent %zu bytes (payload: %zu, header+mask: %zu)\n", 
-           total_len, len, header_len);
-    
-    return sent;
+    free(frame);
+    g_print("DEBUG: net_client_send completed successfully\n");
+    return len;
 }
 
 void net_client_service(net_client_t *client) {

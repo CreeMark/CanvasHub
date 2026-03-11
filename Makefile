@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -std=c17 -Wall -Wextra -g -D_GNU_SOURCE -fstack-protector-strong
-INCLUDES = -Iinclude -Ideps/cJSON -Itests/unity
+INCLUDES = -Iinclude -Ideps/cJSON -Itests/unity -Isrc
 
 # Libraries
 LIBS_GUI = $(shell pkg-config --libs gtk+-3.0 cairo)
@@ -25,13 +25,15 @@ DEPS_DIR = deps
 TEST_DIR = tests
 
 # Sources
-SRCS_COMMON = $(wildcard $(SRC_DIR)/common/*.c) \
+
+SRCS_SERVER = $(wildcard $(SRC_DIR)/server/*.c) $(filter-out $(SRC_DIR)/common/core_logic.c, $(wildcard $(SRC_DIR)/common/*.c)) \
               $(wildcard $(SRC_DIR)/protocol/*.c) \
               $(wildcard $(SRC_DIR)/utils/*.c) \
               $(DEPS_DIR)/cJSON/cJSON.c
-
-SRCS_SERVER = $(wildcard $(SRC_DIR)/server/*.c) $(SRCS_COMMON)
-SRCS_CLIENT = $(wildcard $(SRC_DIR)/client/*.c) $(SRCS_COMMON)
+SRCS_CLIENT = $(wildcard $(SRC_DIR)/client/*.c) $(wildcard $(SRC_DIR)/common/*.c) \
+              $(wildcard $(SRC_DIR)/protocol/*.c) \
+              $(wildcard $(SRC_DIR)/utils/*.c) \
+              $(DEPS_DIR)/cJSON/cJSON.c
 
 SRCS_TEST = $(TEST_DIR)/test_protocol.c \
             $(TEST_DIR)/unity/unity.c \

@@ -1,27 +1,30 @@
 #ifndef UTILS_H
 #define UTILS_H
 
-#include <stdint.h>
-#include <stddef.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// 简单的日志函数
-void log_info(const char *fmt, ...);
-void log_error(const char *fmt, ...);
-void log_debug(const char *fmt, ...);
+#include <stdarg.h>
+#include <stddef.h>
 
-// 时间戳获取
-uint64_t get_timestamp_ms(void);
+// 安全的字符串复制
+char *safe_strdup(const char *str);
 
-// 字符串哈希 (SHA256 简化版，用于密码存储前的简单处理，实际应使用 OpenSSL)
-// 返回 32 字节哈希值
-void hash_sha256(const char *data, size_t len, uint8_t *out_hash);
+// 安全的内存分配
+void *safe_malloc(size_t size);
 
-// 随机数生成 (用于 Session ID)
-uint32_t random_u32(void);
+// 安全的内存重分配
+void *safe_realloc(void *ptr, size_t size);
+
+// 安全的内存释放
+void safe_free(void **ptr);
+
+// 字符串拼接
+char *str_concat(const char *str1, const char *str2);
+
+// 字符串格式化
+char *str_printf(const char *format, ...);
 
 #ifdef __cplusplus
 }

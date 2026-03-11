@@ -17,3 +17,4 @@ obj/
 *.dll
 __pycache__/
 docs/
+tests/

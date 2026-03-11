@@ -27,6 +27,13 @@ typedef struct {
     time_t updated_at;
 } project_t;
 
+// 聊天消息结构
+typedef struct {
+    char sender[64];
+    char content[512];
+    uint64_t timestamp;
+} chat_msg_db_t;
+
 // 数据库连接配置
 typedef struct {
     char host[64];
@@ -66,6 +73,13 @@ int db_save_project_data(uint32_t project_id, const char *data);
 // 获取项目画布数据
 // 返回动态分配的字符串，调用者需 free
 char *db_get_project_data(uint32_t project_id);
+
+// 保存聊天消息
+int db_save_chat_message(uint32_t project_id, const char *sender, const char *content, uint64_t timestamp);
+
+// 获取聊天历史
+// 返回消息数组，count 为消息数量
+chat_msg_db_t *db_get_chat_messages(uint32_t project_id, int *count, int limit);
 
 // 关闭数据库连接
 void db_close(void);

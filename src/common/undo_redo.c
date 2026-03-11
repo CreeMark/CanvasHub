@@ -1,9 +1,10 @@
 #include "canvas.h"
+#include "undo_redo.h"
 #include <stdlib.h>
 #include <string.h>
+#include <glib.h>
 #include "cJSON.h"
 
-// 简单的双向链表实现 Undo/Redo
 typedef struct action_node_s {
     draw_cmd_t cmd;
     struct action_node_s *prev;
@@ -11,11 +12,14 @@ typedef struct action_node_s {
 } action_node_t;
 
 typedef struct {
-    action_node_t *head; // 最早的操作
-    action_node_t *tail; // 最新的操作
-    action_node_t *current; // 当前指针
+    action_node_t *head;
+    action_node_t *tail;
+    action_node_t *current;
     int count;
     int max_steps;
+    draw_cmd_t *current_action;
+    size_t current_point_count;
+    size_t current_capacity;
 } history_t;
 
 static history_t g_history = {0};
@@ -35,7 +39,131 @@ void undo_redo_init(int max_steps) {
     g_history.max_steps = max_steps;
 }
 
+// 开始一个新的操作
+void undo_redo_start_action(tool_type_t tool, uint32_t color, double line_width) {
+    // 清理之前可能未完成的操作
+    if (g_history.current_action) {
+        free(g_history.current_action->points);
+        free(g_history.current_action);
+    }
+    
+    g_history.current_action = malloc(sizeof(draw_cmd_t));
+    if (g_history.current_action) {
+        g_history.current_action->tool = tool;
+        g_history.current_action->color = color;
+        g_history.current_action->line_width = line_width;
+        g_history.current_action->point_count = 0;
+        g_history.current_action->points = NULL;
+        g_history.current_action->layer_id = 0;
+        g_history.current_point_count = 0;
+        g_history.current_capacity = 16; // 初始容量
+        g_history.current_action->points = malloc(sizeof(point_t) * g_history.current_capacity);
+    }
+}
+
+// 添加点到当前操作
+void undo_redo_add_point(double x, double y) {
+    if (!g_history.current_action) return;
+    
+    // 扩容
+    if (g_history.current_point_count >= g_history.current_capacity) {
+        g_history.current_capacity *= 2;
+        g_history.current_action->points = realloc(g_history.current_action->points, sizeof(point_t) * g_history.current_capacity);
+    }
+    
+    if (g_history.current_action->points) {
+        g_history.current_action->points[g_history.current_point_count].x = x;
+        g_history.current_action->points[g_history.current_point_count].y = y;
+        g_history.current_point_count++;
+        g_history.current_action->point_count = g_history.current_point_count;
+    }
+}
+
+// 结束当前操作并添加到历史记录
+void undo_redo_end_action() {
+    if (!g_history.current_action || g_history.current_point_count < 2) {
+        // 操作点太少，不添加到历史
+        if (g_history.current_action) {
+            free(g_history.current_action->points);
+            free(g_history.current_action);
+        }
+        g_history.current_action = NULL;
+        g_history.current_point_count = 0;
+        g_history.current_capacity = 0;
+        return;
+    }
+    
+    // 如果当前不是在末尾，删除 current 之后的所有节点
+    if (g_history.current != g_history.tail) {
+        action_node_t *node = g_history.current ? g_history.current->next : g_history.head;
+        
+        while (node) {
+            action_node_t *next = node->next;
+            if (node->cmd.points) free(node->cmd.points);
+            free(node);
+            node = next;
+            g_history.count--;
+        }
+        if (g_history.current) {
+            g_history.current->next = NULL;
+            g_history.tail = g_history.current;
+        } else {
+            g_history.head = NULL;
+            g_history.tail = NULL;
+        }
+    }
+
+    // 创建新节点
+    action_node_t *new_node = malloc(sizeof(action_node_t));
+    new_node->cmd = *g_history.current_action;
+    // 深拷贝 points
+    if (g_history.current_action->point_count > 0 && g_history.current_action->points) {
+        new_node->cmd.points = malloc(sizeof(point_t) * g_history.current_action->point_count);
+        if (new_node->cmd.points) {
+            memcpy(new_node->cmd.points, g_history.current_action->points, sizeof(point_t) * g_history.current_action->point_count);
+        }
+    } else {
+        new_node->cmd.points = NULL;
+    }
+    new_node->next = NULL;
+    new_node->prev = g_history.tail;
+
+    if (g_history.tail) {
+        g_history.tail->next = new_node;
+    } else {
+        g_history.head = new_node;
+    }
+    g_history.tail = new_node;
+    g_history.current = new_node;
+    g_history.count++;
+
+    // 限制步数
+    if (g_history.count > g_history.max_steps) {
+        action_node_t *old_head = g_history.head;
+        if (old_head) {
+            g_history.head = old_head->next;
+            if (g_history.head) g_history.head->prev = NULL;
+            
+            // Critical fix: Update tail/current if they point to the removed head
+            if (g_history.tail == old_head) g_history.tail = NULL;
+            if (g_history.current == old_head) g_history.current = NULL;
+            
+            if (old_head->cmd.points) free(old_head->cmd.points);
+            free(old_head);
+            g_history.count--;
+        }
+    }
+    
+    // 清理当前操作
+    free(g_history.current_action->points);
+    free(g_history.current_action);
+    g_history.current_action = NULL;
+    g_history.current_point_count = 0;
+    g_history.current_capacity = 0;
+}
+
 void undo_redo_push(const draw_cmd_t *cmd) {
+    // 兼容旧接口，用于非绘制操作（如clear）
     // 如果当前不是在末尾，删除 current 之后的所有节点
     if (g_history.current != g_history.tail) {
         action_node_t *node = g_history.current ? g_history.current->next : g_history.head;
@@ -150,6 +278,43 @@ void undo_redo_iterate(void (*cb)(const draw_cmd_t *, void *), void *user_data) 
         node = node->next;
     }
     g_print("DEBUG: undo_redo_iterate - iterated %d commands\n", count);
+}
+
+// 分批迭代函数，从start_idx开始，最多遍历batch_size个命令
+void undo_redo_iterate_range(int start_idx, int batch_size, void (*cb)(const draw_cmd_t *, void *), void *user_data) {
+    g_print("DEBUG: undo_redo_iterate_range - start_idx=%d, batch_size=%d\n", start_idx, batch_size);
+    if (!g_history.head) {
+        g_print("WARNING: undo_redo_iterate_range - head is NULL\n");
+        return;
+    }
+    
+    // If current is NULL, it means we are at the state BEFORE the first action.
+    // So we should not iterate anything (empty canvas).
+    if (!g_history.current) {
+        g_print("WARNING: undo_redo_iterate_range - current is NULL\n");
+        return;
+    }
+
+    action_node_t *node = g_history.head;
+    int count = 0;
+    int current_idx = 0;
+    
+    // 找到起始位置
+    while (node && current_idx < start_idx) {
+        if (node == g_history.current) break;
+        node = node->next;
+        current_idx++;
+    }
+    
+    // 遍历batch_size个命令
+    while (node && count < batch_size) {
+        count++;
+        cb(&node->cmd, user_data);
+        if (node == g_history.current) break; // 只遍历到当前状态
+        node = node->next;
+    }
+    
+    g_print("DEBUG: undo_redo_iterate_range - iterated %d commands\n", count);
 }
 
 char *undo_redo_serialize(void) {
